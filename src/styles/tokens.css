@@ -1,0 +1,183 @@
+@import "tailwindcss";
+
+/* =========================================================
+   SquireDB design tokens — Klein design system
+   Source: design_handoff_db_agent/tokens.md
+   ========================================================= */
+:root {
+  --font-sans: "Inter", -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  --font-mono: "JetBrains Mono", "SF Mono", Menlo, Consolas, monospace;
+
+  --bg: #f4f3ee;
+  --bg-2: #ebeae3;
+  --panel: #ffffff;
+  --panel-2: #fbfaf6;
+  --border: #e3e1d8;
+  --border-2: #d4d2c7;
+
+  --ink: #1a1a17;
+  --ink-2: #4a4a45;
+  --muted: #7a7a72;
+  --subtle: #a8a7a0;
+
+  --acc: #006d68;
+  --acc-2: #008c85;
+  --acc-soft: #d6ebe9;
+  --acc-ink: #003e3b;
+
+  --crit: #b42318;
+  --crit-soft: #fee4e2;
+  --warn: #b54708;
+  --warn-soft: #fef0c7;
+  --ok: #027a48;
+  --ok-soft: #d1fadf;
+  --info: #175cd3;
+  --info-soft: #d1e9ff;
+
+  --pii: #7c3aed;
+  --pii-soft: #ede4ff;
+
+  --sh-1: 0 1px 2px rgba(20, 20, 15, 0.04);
+  --sh-2: 0 4px 16px rgba(20, 20, 15, 0.06);
+  --sh-3: 0 12px 40px rgba(20, 20, 15, 0.12);
+
+  --r-sm: 4px;
+  --r-md: 6px;
+  --r-lg: 10px;
+}
+
+/* =========================================================
+   Map tokens to Tailwind v4 theme so utilities resolve them
+   - colors: bg-bg, text-ink, border-border, etc.
+   - fonts: font-sans, font-mono
+   - radius: rounded-sm/md/lg
+   - shadows: shadow-1/2/3
+   ========================================================= */
+@theme {
+  --font-sans: "Inter", -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  --font-mono: "JetBrains Mono", "SF Mono", Menlo, Consolas, monospace;
+
+  --color-bg: #f4f3ee;
+  --color-bg-2: #ebeae3;
+  --color-panel: #ffffff;
+  --color-panel-2: #fbfaf6;
+  --color-border: #e3e1d8;
+  --color-border-2: #d4d2c7;
+
+  --color-ink: #1a1a17;
+  --color-ink-2: #4a4a45;
+  --color-muted: #7a7a72;
+  --color-subtle: #a8a7a0;
+
+  --color-acc: #006d68;
+  --color-acc-2: #008c85;
+  --color-acc-soft: #d6ebe9;
+  --color-acc-ink: #003e3b;
+
+  --color-crit: #b42318;
+  --color-crit-soft: #fee4e2;
+  --color-warn: #b54708;
+  --color-warn-soft: #fef0c7;
+  --color-ok: #027a48;
+  --color-ok-soft: #d1fadf;
+  --color-info: #175cd3;
+  --color-info-soft: #d1e9ff;
+
+  --color-pii: #7c3aed;
+  --color-pii-soft: #ede4ff;
+
+  --radius-sm: 4px;
+  --radius-md: 6px;
+  --radius-lg: 10px;
+
+  --shadow-1: 0 1px 2px rgba(20, 20, 15, 0.04);
+  --shadow-2: 0 4px 16px rgba(20, 20, 15, 0.06);
+  --shadow-3: 0 12px 40px rgba(20, 20, 15, 0.12);
+}
+
+/* =========================================================
+   Base — applied alongside existing App.css, kept additive
+   so current screens keep rendering during the migration.
+   ========================================================= */
+html,
+body {
+  margin: 0;
+  padding: 0;
+  height: 100%;
+}
+
+body {
+  font-family: var(--font-sans);
+  font-feature-settings: "cv11", "ss01";
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+code,
+kbd,
+pre,
+samp {
+  font-family: var(--font-mono);
+}
+
+/* Kill native macOS button rendering — Tailwind v4 preflight sets
+   appearance: button which makes WebKit draw the system pill control
+   (rounded white shadowed pills on every <button>). The full reset
+   covers shadow + background to neutralize the native control entirely. */
+button,
+input[type="button"],
+input[type="reset"],
+input[type="submit"] {
+  -webkit-appearance: none !important;
+  appearance: none !important;
+  background-image: none !important;
+  box-shadow: none !important;
+  text-shadow: none !important;
+}
+
+/* Same for select — macOS draws a chevron + gradient on native selects */
+select {
+  -webkit-appearance: none !important;
+  appearance: none !important;
+  background-image: none !important;
+  box-shadow: none !important;
+}
+
+/* Shared form input — Klein design system */
+.form-input {
+  height: 32px;
+  padding: 0 10px;
+  background: var(--panel-2);
+  border: 1px solid var(--border);
+  border-radius: var(--r-md);
+  font-family: var(--font-mono);
+  font-size: 12px;
+  color: var(--ink);
+  outline: none;
+  width: 100%;
+  transition: border-color 0.12s, box-shadow 0.12s;
+}
+.form-input::placeholder {
+  color: var(--subtle);
+  font-family: var(--font-mono);
+}
+.form-input:focus {
+  border-color: var(--acc);
+  box-shadow: 0 0 0 3px rgba(0, 109, 104, 0.12);
+  background: var(--panel);
+}
+.form-input:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+/* Hide native number input spinners */
+.no-spin::-webkit-outer-spin-button,
+.no-spin::-webkit-inner-spin-button {
+  -webkit-appearance: none;
+  margin: 0;
+}
+.no-spin {
+  -moz-appearance: textfield;
+}
+
