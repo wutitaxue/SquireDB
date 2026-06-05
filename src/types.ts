@@ -79,6 +79,16 @@ export type EmbeddingConfigView = {
   has_api_key: boolean;
 };
 
+export type McpStatus = {
+  enabled: boolean;
+  bindPort: number;
+  readOnly: boolean;
+  allowedConnIds: number[];
+  running: boolean;
+  actualPort: number;
+  requiresRestart: boolean;
+};
+
 export type HistoryEntry = {
   id: number;
   connection_id: number;

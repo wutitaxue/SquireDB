@@ -10,6 +10,7 @@ mod drill;
 mod embed;
 mod health;
 mod llm_log;
+mod mcp;
 mod milvus;
 mod perf;
 mod query;
@@ -20,12 +21,14 @@ use sqlx::mysql::{MySqlConnectOptions, MySqlPoolOptions};
 use sqlx::{MySqlPool, SqlitePool};
 use std::collections::HashMap;
 use std::fs;
+use std::sync::Arc;
 use std::time::Duration;
 use tauri::{Manager, State};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, RwLock};
 
 use query::QueryResult;
 use storage::connection::Connection;
+use storage::mcp_settings::McpSettings;
 
 const DEFAULT_AI_BASE_URL: &str = "https://api.openai.com/v1";
 const DEFAULT_AI_MODEL: &str = "gpt-4o-mini";
@@ -34,10 +37,13 @@ const DEFAULT_EMBEDDING_MODEL: &str = "text-embedding-3-small";
 
 struct AppState {
     sqlite: SqlitePool,
-    active_pools: Mutex<HashMap<i64, MySqlPool>>,
+    active_pools: Arc<Mutex<HashMap<i64, MySqlPool>>>,
     active_milvus: Mutex<HashMap<i64, milvus::MilvusClient>>,
     // query_token -> (connection_id, mysql_thread_id) for in-flight queries
     running_queries: Mutex<HashMap<String, (i64, u64)>>,
+    // Shared with the MCP server task so allowlist edits take effect live
+    // without restarting Squire. Empty Vec means "allow all".
+    mcp_allowed_conns: Arc<RwLock<Vec<i64>>>,
 }
 
 #[tauri::command]
@@ -3816,6 +3822,99 @@ async fn get_innodb_status_raw(
     Ok(text)
 }
 
+// ---------- MCP settings commands ---------- //
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct McpStatus {
+    enabled: bool,
+    bind_port: u16,
+    read_only: bool,
+    allowed_conn_ids: Vec<i64>,
+    running: bool,
+    actual_port: u16,
+    requires_restart: bool,
+}
+
+fn requires_restart(saved: &McpSettings) -> bool {
+    let running = mcp::SERVER_RUNNING.load(std::sync::atomic::Ordering::SeqCst);
+    let actual = mcp::SERVER_PORT.load(std::sync::atomic::Ordering::SeqCst);
+    if saved.enabled != running {
+        return true;
+    }
+    if saved.enabled && actual != saved.bind_port {
+        return true;
+    }
+    false
+}
+
+#[tauri::command]
+async fn get_mcp_status(state: State<'_, AppState>) -> Result<McpStatus, String> {
+    let settings = storage::mcp_settings::get(&state.sqlite).await?;
+    let running = mcp::SERVER_RUNNING.load(std::sync::atomic::Ordering::SeqCst);
+    let actual_port = mcp::SERVER_PORT.load(std::sync::atomic::Ordering::SeqCst);
+    let requires_restart = requires_restart(&settings);
+    Ok(McpStatus {
+        enabled: settings.enabled,
+        bind_port: settings.bind_port,
+        read_only: settings.read_only,
+        allowed_conn_ids: settings.allowed_conn_ids,
+        running,
+        actual_port,
+        requires_restart,
+    })
+}
+
+#[tauri::command]
+async fn set_mcp_enabled(
+    state: State<'_, AppState>,
+    enabled: bool,
+) -> Result<McpStatus, String> {
+    let mut s = storage::mcp_settings::get(&state.sqlite).await?;
+    s.enabled = enabled;
+    storage::mcp_settings::save(&state.sqlite, &s).await?;
+    get_mcp_status(state).await
+}
+
+#[tauri::command]
+async fn set_mcp_port(
+    state: State<'_, AppState>,
+    port: u16,
+) -> Result<McpStatus, String> {
+    if port < 1024 {
+        return Err("port must be >= 1024".to_string());
+    }
+    let mut s = storage::mcp_settings::get(&state.sqlite).await?;
+    s.bind_port = port;
+    storage::mcp_settings::save(&state.sqlite, &s).await?;
+    get_mcp_status(state).await
+}
+
+#[tauri::command]
+async fn set_mcp_allowed_conns(
+    state: State<'_, AppState>,
+    ids: Vec<i64>,
+) -> Result<McpStatus, String> {
+    let mut s = storage::mcp_settings::get(&state.sqlite).await?;
+    s.allowed_conn_ids = ids.clone();
+    storage::mcp_settings::save(&state.sqlite, &s).await?;
+    // Live-update the shared snapshot — server picks it up on next request.
+    *state.mcp_allowed_conns.write().await = ids;
+    get_mcp_status(state).await
+}
+
+#[tauri::command]
+async fn get_mcp_token(state: State<'_, AppState>) -> Result<String, String> {
+    crypto::ensure_mcp_token(&state.sqlite).await
+}
+
+#[tauri::command]
+async fn regenerate_mcp_token(state: State<'_, AppState>) -> Result<String, String> {
+    let token = crypto::generate_mcp_token();
+    crypto::set_mcp_token(&state.sqlite, &token).await?;
+    Ok(token)
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -3837,11 +3936,55 @@ pub fn run() {
                 storage::init_pool(&db_path).await
             })?;
 
+            let active_pools = Arc::new(Mutex::new(HashMap::<i64, MySqlPool>::new()));
+
+            // Seed allowlist from SQLite on boot so the Tauri command and the
+            // MCP server start in sync. Shared Arc lets later edits propagate
+            // to the server without a restart.
+            let initial_settings = tauri::async_runtime::block_on(async {
+                storage::mcp_settings::get(&pool).await
+            })
+            .unwrap_or_default();
+            let mcp_allowed_conns =
+                Arc::new(RwLock::new(initial_settings.allowed_conn_ids.clone()));
+
+            // Boot MCP server if enabled. Token is seeded on first run.
+            let mcp_sqlite = pool.clone();
+            let mcp_pools = active_pools.clone();
+            let mcp_allowed_for_server = mcp_allowed_conns.clone();
+            let bind_port = initial_settings.bind_port;
+            let enabled = initial_settings.enabled;
+            tauri::async_runtime::spawn(async move {
+                if !enabled {
+                    eprintln!("[MCP] disabled in settings; not starting server");
+                    return;
+                }
+                let token = match crypto::ensure_mcp_token(&mcp_sqlite).await {
+                    Ok(t) => t,
+                    Err(e) => {
+                        eprintln!("[MCP] failed to ensure token: {e}");
+                        return;
+                    }
+                };
+                if let Err(e) = mcp::serve(
+                    bind_port,
+                    token,
+                    mcp_sqlite,
+                    mcp_pools,
+                    mcp_allowed_for_server,
+                )
+                .await
+                {
+                    eprintln!("[MCP] server exited: {e}");
+                }
+            });
+
             app.manage(AppState {
                 sqlite: pool,
-                active_pools: Mutex::new(HashMap::new()),
+                active_pools,
                 active_milvus: Mutex::new(HashMap::new()),
                 running_queries: Mutex::new(HashMap::new()),
+                mcp_allowed_conns,
             });
             Ok(())
         })
@@ -3932,6 +4075,12 @@ pub fn run() {
             milvus_describe_collection,
             milvus_search,
             milvus_query,
+            get_mcp_status,
+            set_mcp_enabled,
+            set_mcp_port,
+            set_mcp_allowed_conns,
+            get_mcp_token,
+            regenerate_mcp_token,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

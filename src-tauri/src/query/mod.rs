@@ -440,10 +440,13 @@ pub fn value_to_json(row: &MySqlRow, idx: usize) -> serde_json::Value {
     let type_name = row.column(idx).type_info().name().to_uppercase();
 
     match type_name.as_str() {
-        "TINYINT" | "SMALLINT" | "MEDIUMINT" | "INT" | "BIGINT" | "TINYINT UNSIGNED"
-        | "SMALLINT UNSIGNED" | "MEDIUMINT UNSIGNED" | "INT UNSIGNED" => row
+        "TINYINT" | "SMALLINT" | "MEDIUMINT" | "INT" | "BIGINT" => row
             .try_get::<i64, _>(idx)
             .map(serde_json::Value::from)
+            .unwrap_or(serde_json::Value::Null),
+        "TINYINT UNSIGNED" | "SMALLINT UNSIGNED" | "MEDIUMINT UNSIGNED" | "INT UNSIGNED" => row
+            .try_get::<u32, _>(idx)
+            .map(|v| serde_json::Value::from(v as u64))
             .unwrap_or(serde_json::Value::Null),
         "BIGINT UNSIGNED" => row
             .try_get::<u64, _>(idx)

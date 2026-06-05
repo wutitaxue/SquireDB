@@ -7,6 +7,7 @@ pub mod annotation;
 pub mod connection;
 pub mod drill_history;
 pub mod history;
+pub mod mcp_settings;
 pub mod project;
 pub mod relation;
 pub mod repair;
@@ -264,6 +265,21 @@ async fn init_schema(pool: &SqlitePool) -> Result<(), sqlx::Error> {
     sqlx::query(
         "CREATE INDEX IF NOT EXISTS idx_repair_sessions_conn \
          ON repair_sessions(connection_id, id DESC)",
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS mcp_settings (
+            id INTEGER PRIMARY KEY CHECK (id = 1),
+            enabled INTEGER NOT NULL DEFAULT 1,
+            bind_port INTEGER NOT NULL DEFAULT 7421,
+            read_only INTEGER NOT NULL DEFAULT 1,
+            allowed_conn_ids TEXT NOT NULL DEFAULT '[]',
+            updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        )
+        "#,
     )
     .execute(pool)
     .await?;

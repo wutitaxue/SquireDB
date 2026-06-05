@@ -15,6 +15,7 @@ use sqlx::SqlitePool;
 
 const AI_KEY: &str = "ai:apikey";
 const EMBEDDING_KEY: &str = "embedding:apikey";
+const MCP_TOKEN: &str = "mcp:token";
 const HKDF_INFO: &[u8] = b"squiredb-v1-secret-store";
 const HKDF_SALT: &[u8] = b"squiredb-static-salt";
 
@@ -132,4 +133,28 @@ pub async fn get_embedding_key(pool: &SqlitePool) -> Result<String, String> {
 
 pub async fn has_embedding_key(pool: &SqlitePool) -> bool {
     matches!(get_embedding_key(pool).await, Ok(ref s) if !s.is_empty())
+}
+
+pub fn generate_mcp_token() -> String {
+    let mut bytes = [0u8; 32];
+    rand::thread_rng().fill_bytes(&mut bytes);
+    bytes.iter().map(|b| format!("{:02x}", b)).collect()
+}
+
+pub async fn get_mcp_token(pool: &SqlitePool) -> Result<String, String> {
+    Ok(fetch(pool, MCP_TOKEN).await?.unwrap_or_default())
+}
+
+pub async fn set_mcp_token(pool: &SqlitePool, token: &str) -> Result<(), String> {
+    put(pool, MCP_TOKEN, token).await
+}
+
+pub async fn ensure_mcp_token(pool: &SqlitePool) -> Result<String, String> {
+    let existing = get_mcp_token(pool).await?;
+    if !existing.is_empty() {
+        return Ok(existing);
+    }
+    let token = generate_mcp_token();
+    set_mcp_token(pool, &token).await?;
+    Ok(token)
 }
