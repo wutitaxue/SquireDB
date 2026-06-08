@@ -1,4 +1,18 @@
-export type ConnectionKind = "mysql" | "milvus";
+export type ConnectionKind = "mysql" | "milvus" | "sqlite" | "redis";
+
+export type RedisKeyValue =
+  | { type: "string"; value: string }
+  | { type: "list"; values: string[]; truncated: boolean; total: number }
+  | { type: "set"; values: string[]; truncated: boolean; total: number }
+  | { type: "hash"; entries: [string, string][]; truncated: boolean; total: number }
+  | { type: "zset"; entries: [string, number][]; truncated: boolean; total: number }
+  | { type: "none" }
+  | { type: "other"; type_name: string };
+
+export type RedisScanResult = {
+  cursor: number;
+  keys: string[];
+};
 
 export type Connection = {
   id: number | null;
@@ -1053,6 +1067,26 @@ export const emptyMilvusConnection: Connection = {
   username: "",
   database: null,
   kind: "milvus",
+};
+
+export const emptySqliteConnection: Connection = {
+  id: null,
+  name: "",
+  host: "",
+  port: 0,
+  username: "",
+  database: null,
+  kind: "sqlite",
+};
+
+export const emptyRedisConnection: Connection = {
+  id: null,
+  name: "",
+  host: "localhost",
+  port: 6379,
+  username: "",
+  database: "0",
+  kind: "redis",
 };
 
 // ============================================================================

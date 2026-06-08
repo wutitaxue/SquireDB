@@ -5,6 +5,7 @@ import type {
   Connection,
   ProjectTable,
 } from "../../types";
+import { TreeGroupRow } from "../atoms/TreeGroupRow";
 
 export type ProjectTreeFilter = "x-conn" | "x-db" | "closed";
 
@@ -158,36 +159,32 @@ export function ProjectTreeView({
         const dbCollapsed = collapsedDbs.has(dbKey);
         return (
           <li key={dbKey}>
-            <button
+            <TreeGroupRow
+              expanded={!dbCollapsed}
               onClick={() => toggleDb(connId, db)}
-              className="w-full flex items-center gap-1.5 h-6 px-2 text-[12px] rounded hover:bg-bg"
+              label={db}
               title={`${db} · ${connLabel(connId)}${connOpen ? "" : " (closed)"}`}
-            >
-              <span className="text-[9px] text-subtle w-2 shrink-0">
-                {dbCollapsed ? "▸" : "▾"}
-              </span>
-              <span
-                className="font-medium text-ink-2 truncate text-left"
-              >
-                {db}
-              </span>
-              <span
-                className={`shrink-0 h-[14px] px-1 rounded text-[9px] font-bold uppercase tracking-wider flex items-center gap-1 ${
-                  connOpen
-                    ? "bg-bg text-muted"
-                    : "bg-warn-soft text-warn"
-                }`}
-                title={`Connection: ${connLabel(connId)}`}
-              >
-                <span
-                  className={`w-1 h-1 rounded-full ${connOpen ? "bg-ok" : "bg-warn"}`}
-                />
-                {connLabel(connId)}
-              </span>
-              <span className="ml-auto text-[10px] text-subtle font-mono shrink-0">
-                {items.length}
-              </span>
-            </button>
+              trailing={
+                <>
+                  <span
+                    className={`shrink-0 h-[14px] px-1 rounded text-[9px] font-bold uppercase tracking-wider flex items-center gap-1 ${
+                      connOpen
+                        ? "bg-bg text-muted"
+                        : "bg-warn-soft text-warn"
+                    }`}
+                    title={`Connection: ${connLabel(connId)}`}
+                  >
+                    <span
+                      className={`w-1 h-1 rounded-full ${connOpen ? "bg-ok" : "bg-warn"}`}
+                    />
+                    {connLabel(connId)}
+                  </span>
+                  <span className="text-[10px] text-subtle font-mono shrink-0">
+                    {items.length}
+                  </span>
+                </>
+              }
+            />
             {!dbCollapsed && (
               <ul className="ml-[12px]">
                 {items.map((t) => {

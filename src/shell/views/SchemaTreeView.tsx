@@ -1,6 +1,7 @@
 import { useMemo } from "react";
 import { SYSTEM_DBS, type ColumnMetaForTree, type TableMetaForTree } from "../../types";
 import { fmtCount } from "../../utils";
+import { TreeGroupRow } from "../atoms/TreeGroupRow";
 
 export type SchemaFilter = "pii" | "fk" | "indexed";
 
@@ -149,22 +150,19 @@ export function SchemaTreeView({
         if (filterActive && matchedTables && matchedTables.length === 0) return null;
         return (
           <li key={db}>
-            <button
+            <TreeGroupRow
+              expanded={expanded}
               onClick={() => onToggleDb(db)}
-              className={`w-full flex items-center gap-1.5 h-6 px-2 text-[12px] rounded hover:bg-bg ${
-                isSystem ? "text-muted" : "text-ink-2 font-medium"
-              }`}
-            >
-              <span className="text-[9px] text-subtle w-2 shrink-0">
-                {expanded ? "▾" : "▸"}
-              </span>
-              <span className="truncate flex-1 text-left">{db}</span>
-              {tables && (
-                <span className="text-[10px] text-subtle font-mono shrink-0">
-                  {fmtCount(tables.length) || tables.length}
-                </span>
-              )}
-            </button>
+              label={db}
+              muted={isSystem}
+              trailing={
+                tables ? (
+                  <span className="text-[10px] text-subtle font-mono shrink-0">
+                    {fmtCount(tables.length) || tables.length}
+                  </span>
+                ) : undefined
+              }
+            />
             {expanded && tables && (
               <ul className="ml-[12px]">
                 {(matchedTables ?? tables).length === 0 && (

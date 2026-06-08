@@ -14,6 +14,8 @@ function tabIcon(tab: Tab): string {
   if (tab.kind === "project-drill") return "🔍";
   if (tab.kind === "project-agent") return PROJECT_AGENT_META[tab.agent].icon;
   if (tab.kind === "milvus-search") return "◆";
+  if (tab.kind === "redis-key") return "🔑";
+  if (tab.kind === "redis-console") return "❯_";
   return AGENT_META[tab.agent].icon;
 }
 

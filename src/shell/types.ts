@@ -38,12 +38,31 @@ export type MilvusSearchTab = {
   collection: string;
 };
 
+export type RedisKeyTab = {
+  id: string;
+  kind: "redis-key";
+  name: string;
+  connectionId: number;
+  db: number;
+  rkey: string;
+};
+
+export type RedisConsoleTab = {
+  id: string;
+  kind: "redis-console";
+  name: string;
+  connectionId: number;
+  db: number;
+};
+
 export type Tab =
   | QueryTab
   | AgentTab
   | ProjectDrillTab
   | ProjectAgentTab
-  | MilvusSearchTab;
+  | MilvusSearchTab
+  | RedisKeyTab
+  | RedisConsoleTab;
 
 export function milvusSearchTabId(
   connectionId: number,
@@ -51,6 +70,14 @@ export function milvusSearchTabId(
   collection: string,
 ): string {
   return `milvus-search:${connectionId}:${database}:${collection}`;
+}
+
+export function redisKeyTabId(connectionId: number, db: number, key: string): string {
+  return `redis-key:${connectionId}:${db}:${key}`;
+}
+
+export function redisConsoleTabId(connectionId: number, db: number): string {
+  return `redis-console:${connectionId}:${db}`;
 }
 
 export type ProjectAgentId =

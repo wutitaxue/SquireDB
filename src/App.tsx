@@ -33,6 +33,7 @@ import { RepairWorkspace } from "./workspaces/RepairWorkspace";
 import { ErDiagramWorkspace } from "./workspaces/ErDiagramWorkspace";
 import { DeadlockWorkspace } from "./workspaces/DeadlockWorkspace";
 import { MilvusSearchWorkspace } from "./workspaces/MilvusSearchWorkspace";
+import { RedisExplorerShell } from "./workspaces/RedisExplorerShell";
 import { Titlebar } from "./shell/Titlebar";
 import { Tabbar } from "./shell/Tabbar";
 import { WorkspaceSidebar } from "./shell/WorkspaceSidebar";
@@ -56,6 +57,8 @@ import {
   queryTabId,
   workspaceKey,
   milvusSearchTabId,
+  redisKeyTabId,
+  redisConsoleTabId,
   type AgentId,
   type AppMode,
   type ProjectAgentId,
@@ -178,6 +181,17 @@ function App() {
     }
     const wConn = connections.find((c) => c.id === workingId);
     const isMilvus = wConn?.kind === "milvus";
+    const isRedis = wConn?.kind === "redis";
+
+    // Redis has its own explorer shell and doesn't use the SQL schema-tree
+    // pipeline. Skip list_databases / history / annotations / relations.
+    if (isRedis) {
+      setHistory([]);
+      setAnnotations([]);
+      setRelations([]);
+      setDatabases([]);
+      return;
+    }
 
     // Schema tree (databases / tables / columns) works for both kinds —
     // backend dispatches by connection.kind. Load for everyone.
@@ -250,7 +264,7 @@ function App() {
   useEffect(() => {
     if (workingId === null) return;
     const wConn = connections.find((c) => c.id === workingId);
-    if (wConn?.kind === "milvus") return; // skip MySQL polling for Milvus
+    if (wConn?.kind !== "mysql") return; // server_status polling is MySQL-only
     const id = workingId;
     const t = setInterval(() => {
       invoke<RuntimeStatus>("server_status", { connectionId: id })
@@ -372,14 +386,29 @@ function App() {
     if (!editing) return;
     setBusy(true);
     try {
-      const cmd = editing.kind === "milvus" ? "milvus_ping" : "mysql_ping";
-      const msg = await invoke<string>(cmd, {
-        host: editing.host,
-        port: editing.port,
-        user: editing.username,
-        password,
-        database: editing.database || null,
-      });
+      let msg: string;
+      if (editing.kind === "sqlite") {
+        msg = await invoke<string>("sqlite_ping", {
+          path: editing.database || "",
+        });
+      } else if (editing.kind === "redis") {
+        msg = await invoke<string>("redis_ping", {
+          host: editing.host,
+          port: editing.port,
+          user: editing.username,
+          password,
+          db: parseInt(editing.database || "0", 10) || 0,
+        });
+      } else {
+        const cmd = editing.kind === "milvus" ? "milvus_ping" : "mysql_ping";
+        msg = await invoke<string>(cmd, {
+          host: editing.host,
+          port: editing.port,
+          user: editing.username,
+          password,
+          database: editing.database || null,
+        });
+      }
       setResult(msg);
       setIsError(false);
     } catch (err) {
@@ -643,6 +672,45 @@ function App() {
           connectionId,
           database,
           collection,
+        },
+      ];
+    });
+    setActiveTabId(id);
+  }
+
+  function openRedisKey(db: number, rkey: string) {
+    if (workingId === null) return;
+    const id = redisKeyTabId(workingId, db, rkey);
+    setTabs((prev) => {
+      if (prev.some((t) => t.id === id)) return prev;
+      return [
+        ...prev,
+        {
+          id,
+          kind: "redis-key",
+          name: rkey,
+          connectionId: workingId,
+          db,
+          rkey,
+        },
+      ];
+    });
+    setActiveTabId(id);
+  }
+
+  function openRedisConsole(db: number) {
+    if (workingId === null) return;
+    const id = redisConsoleTabId(workingId, db);
+    setTabs((prev) => {
+      if (prev.some((t) => t.id === id)) return prev;
+      return [
+        ...prev,
+        {
+          id,
+          kind: "redis-console",
+          name: `console · database ${db}`,
+          connectionId: workingId,
+          db,
         },
       ];
     });
@@ -1058,7 +1126,17 @@ function App() {
           </main>
         )}
 
-        {mode.kind === "connection" && working && (
+        {mode.kind === "connection" && working && working.kind === "redis" && (
+          <RedisExplorerShell
+            conn={working}
+            tabs={tabs}
+            activeTab={activeTab}
+            onOpenKey={openRedisKey}
+            onOpenConsole={openRedisConsole}
+          />
+        )}
+
+        {mode.kind === "connection" && working && working.kind !== "redis" && (
           <>
             <WorkspaceSidebar
               toolbar={
@@ -1462,16 +1540,28 @@ function Home({
                   </div>
                   <div
                     className="text-[10.5px] text-muted font-mono truncate"
-                    title={`${c.host}:${c.port}`}
+                    title={
+                      c.kind === "sqlite"
+                        ? c.database ?? ""
+                        : `${c.host}:${c.port}`
+                    }
                   >
-                    {c.host}:{c.port}
+                    {c.kind === "sqlite"
+                      ? c.database
+                        ? c.database.split("/").pop() || c.database
+                        : "(no file)"
+                      : `${c.host}:${c.port}`}
                   </div>
                   <div className="text-[10.5px] text-subtle truncate">
                     {c.kind === "milvus"
                       ? c.database
                         ? `db: ${c.database}`
                         : "db: default"
-                      : `${c.username}${c.database ? ` · ${c.database}` : ""}`}
+                      : c.kind === "sqlite"
+                        ? "SQLite"
+                        : c.kind === "redis"
+                          ? `Redis · database ${c.database ?? "0"}`
+                          : `${c.username}${c.database ? ` · ${c.database}` : ""}`}
                   </div>
                 </div>
               ))}

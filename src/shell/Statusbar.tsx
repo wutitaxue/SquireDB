@@ -74,6 +74,33 @@ export function Statusbar({
                 </>
               )}
             </>
+          ) : working.kind === "sqlite" ? (
+            <>
+              <span className="text-border-2">·</span>
+              <span className="font-mono">SQLite</span>
+              {working.database && (
+                <>
+                  <span className="text-border-2">·</span>
+                  <span
+                    className="font-mono truncate max-w-[300px]"
+                    title={working.database}
+                  >
+                    {working.database.split("/").pop() || working.database}
+                  </span>
+                </>
+              )}
+            </>
+          ) : working.kind === "redis" ? (
+            <>
+              <span className="text-border-2">·</span>
+              <span className="font-mono">Redis</span>
+              <span className="text-border-2">·</span>
+              <span className="font-mono">
+                {working.host}:{working.port}
+              </span>
+              <span className="text-border-2">·</span>
+              <span className="font-mono">database {working.database ?? "0"}</span>
+            </>
           ) : (
             <>
               {serverVersion && (

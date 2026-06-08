@@ -14,6 +14,8 @@ mod mcp;
 mod milvus;
 mod perf;
 mod query;
+mod redis_kind;
+mod sqlite_query;
 mod storage;
 
 use serde::Serialize;
@@ -39,6 +41,8 @@ struct AppState {
     sqlite: SqlitePool,
     active_pools: Arc<Mutex<HashMap<i64, MySqlPool>>>,
     active_milvus: Mutex<HashMap<i64, milvus::MilvusClient>>,
+    active_sqlite: Mutex<HashMap<i64, SqlitePool>>,
+    active_redis: Mutex<HashMap<i64, redis::aio::ConnectionManager>>,
     // query_token -> (connection_id, mysql_thread_id) for in-flight queries
     running_queries: Mutex<HashMap<String, (i64, u64)>>,
     // Shared with the MCP server task so allowlist edits take effect live
@@ -80,6 +84,78 @@ async fn mysql_ping(
 }
 
 #[tauri::command]
+async fn redis_ping(
+    host: String,
+    port: u16,
+    user: String,
+    password: String,
+    db: u8,
+) -> Result<String, String> {
+    let mgr = redis_kind::build_manager(&host, port, &user, &password)
+        .await
+        .map_err(|e| format!("connect failed: {e}"))?;
+    let resp = redis_kind::ping(&mgr, db).await?;
+    Ok(format!("Connected. PING → {resp}"))
+}
+
+#[tauri::command]
+async fn redis_scan(
+    state: State<'_, AppState>,
+    connection_id: i64,
+    db: u8,
+    pattern: String,
+    cursor: u64,
+    count: u32,
+) -> Result<serde_json::Value, String> {
+    let mgr = get_redis_manager(&state, connection_id).await?;
+    let pat = if pattern.is_empty() { "*".to_string() } else { pattern };
+    let (next, keys) = redis_kind::scan(&mgr, db, &pat, cursor, count).await?;
+    Ok(serde_json::json!({ "cursor": next, "keys": keys }))
+}
+
+#[tauri::command]
+async fn redis_get_value(
+    state: State<'_, AppState>,
+    connection_id: i64,
+    db: u8,
+    key: String,
+) -> Result<redis_kind::KeyValue, String> {
+    let mgr = get_redis_manager(&state, connection_id).await?;
+    redis_kind::get_value(&mgr, db, &key).await
+}
+
+#[tauri::command]
+async fn redis_exec(
+    state: State<'_, AppState>,
+    connection_id: i64,
+    db: u8,
+    command: String,
+) -> Result<serde_json::Value, String> {
+    let mgr = get_redis_manager(&state, connection_id).await?;
+    redis_kind::exec_command(&mgr, db, &command).await
+}
+
+#[tauri::command]
+async fn sqlite_ping(path: String) -> Result<String, String> {
+    let trimmed = path.trim();
+    if trimmed.is_empty() {
+        return Err("file path is empty".into());
+    }
+    if !std::path::Path::new(trimmed).exists() {
+        return Err(format!("file does not exist: {trimmed}"));
+    }
+    let pool = sqlite_query::build_pool(trimmed)
+        .await
+        .map_err(|e| format!("connect failed: {e}"))?;
+    let (one,): (i64,) = sqlx::query_as("SELECT 1")
+        .fetch_one(&pool)
+        .await
+        .map_err(|e| format!("query failed: {e}"))?;
+    pool.close().await;
+    Ok(format!("Connected. SELECT 1 → {one}"))
+}
+
+#[tauri::command]
 async fn list_connections(state: State<'_, AppState>) -> Result<Vec<Connection>, String> {
     storage::connection::list_all(&state.sqlite)
         .await
@@ -115,11 +191,15 @@ async fn save_connection(
 
 #[tauri::command]
 async fn delete_connection(state: State<'_, AppState>, id: i64) -> Result<(), String> {
-    // Close active pools first (both MySQL and Milvus)
+    // Close active pools first (MySQL, SQLite, Milvus, Redis)
     if let Some(pool) = state.active_pools.lock().await.remove(&id) {
         pool.close().await;
     }
+    if let Some(pool) = state.active_sqlite.lock().await.remove(&id) {
+        pool.close().await;
+    }
     state.active_milvus.lock().await.remove(&id);
+    state.active_redis.lock().await.remove(&id);
     storage::history::delete_by_connection(&state.sqlite, id)
         .await
         .map_err(|e| format!("delete history failed: {e}"))?;
@@ -153,6 +233,12 @@ async fn list_open_connection_ids(state: State<'_, AppState>) -> Result<Vec<i64>
     for k in state.active_milvus.lock().await.keys() {
         ids.insert(*k);
     }
+    for k in state.active_sqlite.lock().await.keys() {
+        ids.insert(*k);
+    }
+    for k in state.active_redis.lock().await.keys() {
+        ids.insert(*k);
+    }
     Ok(ids.into_iter().collect())
 }
 
@@ -179,6 +265,32 @@ async fn open_connection(state: State<'_, AppState>, id: i64) -> Result<(), Stri
             .await
             .map_err(|e| format!("milvus connect failed: {e}"))?;
         state.active_milvus.lock().await.insert(id, client);
+    } else if conn.kind == "sqlite" {
+        if state.active_sqlite.lock().await.contains_key(&id) {
+            return Ok(());
+        }
+        let path = conn.database.as_deref().unwrap_or("").trim().to_string();
+        if path.is_empty() {
+            return Err("sqlite connection has empty file path".into());
+        }
+        let pool = sqlite_query::build_pool(&path)
+            .await
+            .map_err(|e| format!("sqlite open failed: {e}"))?;
+        state.active_sqlite.lock().await.insert(id, pool);
+    } else if conn.kind == "redis" {
+        if state.active_redis.lock().await.contains_key(&id) {
+            return Ok(());
+        }
+        let password = crypto::get_password(&state.sqlite, id).await.unwrap_or_default();
+        let mgr = redis_kind::build_manager(
+            &conn.host,
+            conn.port as u16,
+            &conn.username,
+            &password,
+        )
+        .await
+        .map_err(|e| format!("redis connect failed: {e}"))?;
+        state.active_redis.lock().await.insert(id, mgr);
     } else {
         if state.active_pools.lock().await.contains_key(&id) {
             return Ok(());
@@ -207,7 +319,11 @@ async fn close_connection(state: State<'_, AppState>, id: i64) -> Result<(), Str
     if let Some(pool) = state.active_pools.lock().await.remove(&id) {
         pool.close().await;
     }
+    if let Some(pool) = state.active_sqlite.lock().await.remove(&id) {
+        pool.close().await;
+    }
     state.active_milvus.lock().await.remove(&id);
+    state.active_redis.lock().await.remove(&id);
     Ok(())
 }
 
@@ -338,6 +454,38 @@ async fn execute_query(
     sql: String,
     query_token: Option<String>,
 ) -> Result<QueryResult, String> {
+    if is_sqlite(&state, id).await {
+        let pool = get_sqlite_pool(&state, id).await?;
+        let result = sqlite_query::execute(&pool, &sql).await;
+        match &result {
+            Ok(qr) => {
+                let _ = storage::history::insert(
+                    &state.sqlite,
+                    id,
+                    &sql,
+                    Some(qr.elapsed_ms as i64),
+                    qr.rows_affected.map(|n| n as i64),
+                    Some(qr.rows.len() as i64),
+                    None,
+                )
+                .await;
+            }
+            Err(e) => {
+                let _ = storage::history::insert(
+                    &state.sqlite,
+                    id,
+                    &sql,
+                    None,
+                    None,
+                    None,
+                    Some(&e.to_string()),
+                )
+                .await;
+            }
+        }
+        return result.map_err(|e| format!("query failed: {e}"));
+    }
+
     let pool = state
         .active_pools
         .lock()
@@ -714,11 +862,49 @@ async fn is_milvus(state: &State<'_, AppState>, id: i64) -> bool {
     state.active_milvus.lock().await.contains_key(&id)
 }
 
+async fn is_sqlite(state: &State<'_, AppState>, id: i64) -> bool {
+    state.active_sqlite.lock().await.contains_key(&id)
+}
+
+async fn get_sqlite_pool(state: &State<'_, AppState>, id: i64) -> Result<SqlitePool, String> {
+    state
+        .active_sqlite
+        .lock()
+        .await
+        .get(&id)
+        .cloned()
+        .ok_or_else(|| "SQLite connection not open. Click 'Open' first.".to_string())
+}
+
+#[allow(dead_code)]
+async fn is_redis(state: &State<'_, AppState>, id: i64) -> bool {
+    state.active_redis.lock().await.contains_key(&id)
+}
+
+async fn get_redis_manager(
+    state: &State<'_, AppState>,
+    id: i64,
+) -> Result<redis::aio::ConnectionManager, String> {
+    state
+        .active_redis
+        .lock()
+        .await
+        .get(&id)
+        .cloned()
+        .ok_or_else(|| "Redis connection not open. Click 'Open' first.".to_string())
+}
+
 #[tauri::command]
 async fn list_databases(state: State<'_, AppState>, id: i64) -> Result<Vec<String>, String> {
     if is_milvus(&state, id).await {
         let client = get_milvus_client(&state, id).await?;
         return client.list_databases().await;
+    }
+
+    if is_sqlite(&state, id).await {
+        // SQLite has a single schema per file; expose it as "main" to fit the
+        // existing two-level (database → table) tree shape.
+        return Ok(vec!["main".to_string()]);
     }
 
     let pool = state
@@ -749,6 +935,20 @@ async fn list_tables(
             .list_collections_in(Some(database.as_str()).filter(|s| !s.is_empty()))
             .await?;
         return Ok(cols.into_iter().map(|c| c.name).collect());
+    }
+
+    if is_sqlite(&state, id).await {
+        let pool = get_sqlite_pool(&state, id).await?;
+        let rows: Vec<(String,)> = sqlx::query_as(
+            "SELECT name FROM sqlite_master \
+             WHERE type IN ('table', 'view') \
+             AND name NOT LIKE 'sqlite_%' \
+             ORDER BY name",
+        )
+        .fetch_all(&pool)
+        .await
+        .map_err(|e| format!("list_tables failed: {e}"))?;
+        return Ok(rows.into_iter().map(|(s,)| s).collect());
     }
 
     let pool = state
@@ -1338,6 +1538,22 @@ async fn list_columns(
     database: String,
     table: String,
 ) -> Result<Vec<String>, String> {
+    if is_sqlite(&state, connection_id).await {
+        if !is_safe_sqlite_ident(&table) {
+            return Err(format!("invalid table name: {table}"));
+        }
+        let pool = get_sqlite_pool(&state, connection_id).await?;
+        let rows = sqlx::query(&format!("PRAGMA table_info(\"{table}\")"))
+            .fetch_all(&pool)
+            .await
+            .map_err(|e| format!("list_columns failed: {e}"))?;
+        use sqlx::Row;
+        return Ok(rows
+            .into_iter()
+            .map(|r| r.try_get::<String, _>("name").unwrap_or_default())
+            .collect());
+    }
+
     let pool = state
         .active_pools
         .lock()
@@ -1357,6 +1573,13 @@ async fn list_columns(
     .await
     .map_err(|e| format!("list_columns failed: {e}"))?;
     Ok(rows.into_iter().map(|(c,)| c).collect())
+}
+
+fn is_safe_sqlite_ident(s: &str) -> bool {
+    !s.is_empty()
+        && s.len() < 200
+        && s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '$')
 }
 
 #[derive(Serialize)]
@@ -1385,6 +1608,28 @@ async fn list_table_meta(
             .map(|c| TableMetaForTree {
                 name: c.name,
                 kind: "collection".to_string(),
+                estimated_rows: 0,
+                comment: String::new(),
+            })
+            .collect());
+    }
+
+    if is_sqlite(&state, connection_id).await {
+        let pool = get_sqlite_pool(&state, connection_id).await?;
+        let rows: Vec<(String, String)> = sqlx::query_as(
+            "SELECT name, type FROM sqlite_master \
+             WHERE type IN ('table', 'view') \
+             AND name NOT LIKE 'sqlite_%' \
+             ORDER BY name",
+        )
+        .fetch_all(&pool)
+        .await
+        .map_err(|e| format!("list_table_meta failed: {e}"))?;
+        return Ok(rows
+            .into_iter()
+            .map(|(name, kind)| TableMetaForTree {
+                name,
+                kind,
                 estimated_rows: 0,
                 comment: String::new(),
             })
@@ -1473,6 +1718,71 @@ async fn list_columns_meta(
                     is_indexed: indexed.contains(&f.name),
                     is_foreign_key: false,
                     nullable: f.nullable,
+                }
+            })
+            .collect());
+    }
+
+    if is_sqlite(&state, connection_id).await {
+        if !is_safe_sqlite_ident(&table) {
+            return Err(format!("invalid table name: {table}"));
+        }
+        let pool = get_sqlite_pool(&state, connection_id).await?;
+        use sqlx::Row;
+
+        let col_rows = sqlx::query(&format!("PRAGMA table_info(\"{table}\")"))
+            .fetch_all(&pool)
+            .await
+            .map_err(|e| format!("list_columns_meta failed: {e}"))?;
+
+        // FK columns
+        let fk_rows = sqlx::query(&format!("PRAGMA foreign_key_list(\"{table}\")"))
+            .fetch_all(&pool)
+            .await
+            .map_err(|e| format!("list_columns_meta fk lookup failed: {e}"))?;
+        let fk_cols: std::collections::HashSet<String> = fk_rows
+            .iter()
+            .map(|r| r.try_get::<String, _>("from").unwrap_or_default())
+            .collect();
+
+        // Indexed columns
+        let idx_rows = sqlx::query(&format!("PRAGMA index_list(\"{table}\")"))
+            .fetch_all(&pool)
+            .await
+            .map_err(|e| format!("list_columns_meta index lookup failed: {e}"))?;
+        let mut indexed_cols: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for r in idx_rows.iter() {
+            let idx_name: String = r.try_get("name").unwrap_or_default();
+            if !is_safe_sqlite_ident(&idx_name) {
+                continue;
+            }
+            let info_rows = sqlx::query(&format!("PRAGMA index_info(\"{idx_name}\")"))
+                .fetch_all(&pool)
+                .await
+                .unwrap_or_default();
+            for ir in info_rows.iter() {
+                let c: String = ir.try_get("name").unwrap_or_default();
+                if !c.is_empty() {
+                    indexed_cols.insert(c);
+                }
+            }
+        }
+
+        return Ok(col_rows
+            .into_iter()
+            .map(|r| {
+                let name: String = r.try_get("name").unwrap_or_default();
+                let declared_type: String = r.try_get("type").unwrap_or_default();
+                let notnull: i64 = r.try_get("notnull").unwrap_or(0);
+                let pk: i64 = r.try_get("pk").unwrap_or(0);
+                ColumnMetaForTree {
+                    is_indexed: indexed_cols.contains(&name) || pk > 0,
+                    is_foreign_key: fk_cols.contains(&name),
+                    is_primary: pk > 0,
+                    nullable: notnull == 0,
+                    data_type: declared_type.clone(),
+                    column_type: declared_type,
+                    name,
                 }
             })
             .collect());
@@ -3983,6 +4293,8 @@ pub fn run() {
                 sqlite: pool,
                 active_pools,
                 active_milvus: Mutex::new(HashMap::new()),
+                active_sqlite: Mutex::new(HashMap::new()),
+                active_redis: Mutex::new(HashMap::new()),
                 running_queries: Mutex::new(HashMap::new()),
                 mcp_allowed_conns,
             });
@@ -3990,6 +4302,11 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             mysql_ping,
+            sqlite_ping,
+            redis_ping,
+            redis_scan,
+            redis_get_value,
+            redis_exec,
             list_connections,
             save_connection,
             delete_connection,
