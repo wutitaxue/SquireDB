@@ -971,133 +971,244 @@ async fn list_tables(
     Ok(rows.into_iter().map(|(s,)| s).collect())
 }
 
+const DEFAULT_EMBEDDING_PROVIDER: &str = "openai";
+
 #[derive(Serialize)]
-struct AiConfigView {
+struct AiModelView {
+    id: i64,
+    name: String,
     base_url: String,
     model: String,
-    has_api_key: bool,
     enable_thinking: Option<bool>,
+    has_api_key: bool,
+    is_active: bool,
 }
 
 #[tauri::command]
-async fn get_ai_config(state: State<'_, AppState>) -> Result<AiConfigView, String> {
-    let base_url = storage::settings::get(&state.sqlite, "ai.base_url")
+async fn list_ai_models(state: State<'_, AppState>) -> Result<Vec<AiModelView>, String> {
+    let active = active_ai_model_id(&state.sqlite).await?;
+    let rows = storage::ai_models::list_all(&state.sqlite)
         .await
-        .map_err(|e| e.to_string())?
-        .unwrap_or_else(|| DEFAULT_AI_BASE_URL.to_string());
-    let model = storage::settings::get(&state.sqlite, "ai.model")
-        .await
-        .map_err(|e| e.to_string())?
-        .unwrap_or_else(|| DEFAULT_AI_MODEL.to_string());
-    let has_api_key = crypto::has_ai_key(&state.sqlite).await;
-    let enable_thinking = read_enable_thinking(&state.sqlite).await?;
-    Ok(AiConfigView {
+        .map_err(|e| e.to_string())?;
+    let mut out = Vec::with_capacity(rows.len());
+    for m in rows {
+        let id = m.id.unwrap_or(0);
+        let has_api_key = crypto::has_ai_model_key(&state.sqlite, id).await;
+        out.push(AiModelView {
+            id,
+            name: m.name,
+            base_url: m.base_url,
+            model: m.model,
+            enable_thinking: m.enable_thinking.map(|v| v != 0),
+            has_api_key,
+            is_active: active == Some(id),
+        });
+    }
+    Ok(out)
+}
+
+#[tauri::command]
+async fn create_ai_model(
+    state: State<'_, AppState>,
+    name: String,
+    base_url: String,
+    model: String,
+    api_key: String,
+    enable_thinking: Option<bool>,
+) -> Result<i64, String> {
+    let m = storage::ai_models::AiModel {
+        id: None,
+        name,
         base_url,
         model,
-        has_api_key,
-        enable_thinking,
-    })
+        enable_thinking: enable_thinking.map(|b| if b { 1 } else { 0 }),
+        created_at: None,
+    };
+    let id = storage::ai_models::insert(&state.sqlite, &m)
+        .await
+        .map_err(|e| e.to_string())?;
+    if !api_key.is_empty() {
+        crypto::set_ai_model_key(&state.sqlite, id, &api_key).await?;
+    }
+    // If this is the first model, auto-activate it.
+    if active_ai_model_id(&state.sqlite).await?.is_none() {
+        storage::settings::set(&state.sqlite, "ai.active_model_id", &id.to_string())
+            .await
+            .map_err(|e| e.to_string())?;
+    }
+    Ok(id)
 }
 
 #[tauri::command]
-async fn save_ai_config(
+async fn update_ai_model(
     state: State<'_, AppState>,
+    id: i64,
+    name: String,
     base_url: String,
     model: String,
     api_key: String,
     enable_thinking: Option<bool>,
 ) -> Result<(), String> {
-    storage::settings::set(&state.sqlite, "ai.base_url", &base_url)
+    let m = storage::ai_models::AiModel {
+        id: Some(id),
+        name,
+        base_url,
+        model,
+        enable_thinking: enable_thinking.map(|b| if b { 1 } else { 0 }),
+        created_at: None,
+    };
+    storage::ai_models::update(&state.sqlite, &m)
         .await
-        .map_err(|e| format!("save base_url failed: {e}"))?;
-    storage::settings::set(&state.sqlite, "ai.model", &model)
-        .await
-        .map_err(|e| format!("save model failed: {e}"))?;
-    match enable_thinking {
-        Some(true) => storage::settings::set(&state.sqlite, "ai.enable_thinking", "1")
-            .await
-            .map_err(|e| format!("save enable_thinking failed: {e}"))?,
-        Some(false) => storage::settings::set(&state.sqlite, "ai.enable_thinking", "0")
-            .await
-            .map_err(|e| format!("save enable_thinking failed: {e}"))?,
-        None => {
-            // explicit "follow model default" — clear the key so requests omit `thinking`
-            sqlx::query("DELETE FROM settings WHERE key = ?")
-                .bind("ai.enable_thinking")
-                .execute(&state.sqlite)
-                .await
-                .map_err(|e| format!("clear enable_thinking failed: {e}"))?;
-        }
-    }
+        .map_err(|e| e.to_string())?;
     if !api_key.is_empty() {
-        crypto::set_ai_key(&state.sqlite, &api_key).await?;
+        crypto::set_ai_model_key(&state.sqlite, id, &api_key).await?;
     }
     Ok(())
 }
 
-#[derive(Serialize)]
-struct EmbeddingConfigView {
-    /// "openai" (OpenAI-compatible: OpenAI, DeepSeek-style, vLLM, Voyage, …)
-    /// or "azure" (Azure OpenAI — deployment-scoped URL + api-key header).
-    provider: String,
-    base_url: String,
-    /// OpenAI-only — the model name in the request body. Empty for Azure.
-    model: String,
-    /// Azure-only — deployment name baked into the request URL.
-    deployment: String,
-    /// Azure-only — `api-version` query string.
-    api_version: String,
-    /// Optional output dimension. OpenAI v3 family + Voyage accept it; older
-    /// models reject the field, so we omit it when None.
-    dimensions: Option<u32>,
-    has_api_key: bool,
+#[tauri::command]
+async fn delete_ai_model(state: State<'_, AppState>, id: i64) -> Result<(), String> {
+    storage::ai_models::delete_by_id(&state.sqlite, id)
+        .await
+        .map_err(|e| e.to_string())?;
+    crypto::delete_ai_model_key(&state.sqlite, id).await?;
+    // If the deleted row was active, clear the active pointer so the next
+    // AI call surfaces a clear "no model" error instead of pointing at a ghost.
+    if active_ai_model_id(&state.sqlite).await? == Some(id) {
+        sqlx::query("DELETE FROM settings WHERE key = ?")
+            .bind("ai.active_model_id")
+            .execute(&state.sqlite)
+            .await
+            .map_err(|e| e.to_string())?;
+    }
+    Ok(())
 }
 
-const DEFAULT_EMBEDDING_PROVIDER: &str = "openai";
+#[tauri::command]
+async fn set_active_ai_model(state: State<'_, AppState>, id: i64) -> Result<(), String> {
+    storage::ai_models::get_by_id(&state.sqlite, id)
+        .await
+        .map_err(|_| "model not found".to_string())?;
+    storage::settings::set(&state.sqlite, "ai.active_model_id", &id.to_string())
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+#[derive(Serialize)]
+struct ActiveAiSummary {
+    id: Option<i64>,
+    name: Option<String>,
+    model: Option<String>,
+}
 
 #[tauri::command]
-async fn get_embedding_config(
+async fn get_active_ai_model(state: State<'_, AppState>) -> Result<ActiveAiSummary, String> {
+    match active_ai_model_id(&state.sqlite).await? {
+        Some(id) => match storage::ai_models::get_by_id(&state.sqlite, id).await {
+            Ok(m) => Ok(ActiveAiSummary {
+                id: Some(id),
+                name: Some(m.name),
+                model: Some(m.model),
+            }),
+            Err(_) => Ok(ActiveAiSummary {
+                id: None,
+                name: None,
+                model: None,
+            }),
+        },
+        None => Ok(ActiveAiSummary {
+            id: None,
+            name: None,
+            model: None,
+        }),
+    }
+}
+
+#[derive(Serialize)]
+struct EmbeddingModelView {
+    id: i64,
+    name: String,
+    provider: String,
+    base_url: String,
+    model: String,
+    deployment: String,
+    api_version: String,
+    dimensions: Option<u32>,
+    has_api_key: bool,
+    is_active: bool,
+}
+
+#[tauri::command]
+async fn list_embedding_models(
     state: State<'_, AppState>,
-) -> Result<EmbeddingConfigView, String> {
-    let provider = storage::settings::get(&state.sqlite, "embedding.provider")
+) -> Result<Vec<EmbeddingModelView>, String> {
+    let active = active_embedding_model_id(&state.sqlite).await?;
+    let rows = storage::embedding_models::list_all(&state.sqlite)
         .await
-        .map_err(|e| e.to_string())?
-        .unwrap_or_else(|| DEFAULT_EMBEDDING_PROVIDER.to_string());
-    let base_url = storage::settings::get(&state.sqlite, "embedding.base_url")
-        .await
-        .map_err(|e| e.to_string())?
-        .unwrap_or_else(|| DEFAULT_EMBEDDING_BASE_URL.to_string());
-    let model = storage::settings::get(&state.sqlite, "embedding.model")
-        .await
-        .map_err(|e| e.to_string())?
-        .unwrap_or_else(|| DEFAULT_EMBEDDING_MODEL.to_string());
-    let deployment = storage::settings::get(&state.sqlite, "embedding.deployment")
-        .await
-        .map_err(|e| e.to_string())?
-        .unwrap_or_default();
-    let api_version = storage::settings::get(&state.sqlite, "embedding.api_version")
-        .await
-        .map_err(|e| e.to_string())?
-        .unwrap_or_default();
-    let dimensions = storage::settings::get(&state.sqlite, "embedding.dimensions")
-        .await
-        .map_err(|e| e.to_string())?
-        .and_then(|s| s.parse::<u32>().ok());
-    let has_api_key = crypto::has_embedding_key(&state.sqlite).await;
-    Ok(EmbeddingConfigView {
+        .map_err(|e| e.to_string())?;
+    let mut out = Vec::with_capacity(rows.len());
+    for m in rows {
+        let id = m.id.unwrap_or(0);
+        let has_api_key = crypto::has_embedding_model_key(&state.sqlite, id).await;
+        out.push(EmbeddingModelView {
+            id,
+            name: m.name,
+            provider: m.provider,
+            base_url: m.base_url,
+            model: m.model,
+            deployment: m.deployment,
+            api_version: m.api_version,
+            dimensions: m.dimensions.and_then(|d| u32::try_from(d).ok()),
+            has_api_key,
+            is_active: active == Some(id),
+        });
+    }
+    Ok(out)
+}
+
+#[tauri::command]
+async fn create_embedding_model(
+    state: State<'_, AppState>,
+    name: String,
+    provider: String,
+    base_url: String,
+    model: String,
+    deployment: String,
+    api_version: String,
+    dimensions: Option<u32>,
+    api_key: String,
+) -> Result<i64, String> {
+    let m = storage::embedding_models::EmbeddingModel {
+        id: None,
+        name,
         provider,
         base_url,
         model,
         deployment,
         api_version,
-        dimensions,
-        has_api_key,
-    })
+        dimensions: dimensions.map(|d| d as i64),
+        created_at: None,
+    };
+    let id = storage::embedding_models::insert(&state.sqlite, &m)
+        .await
+        .map_err(|e| e.to_string())?;
+    if !api_key.is_empty() {
+        crypto::set_embedding_model_key(&state.sqlite, id, &api_key).await?;
+    }
+    if active_embedding_model_id(&state.sqlite).await?.is_none() {
+        storage::settings::set(&state.sqlite, "embedding.active_model_id", &id.to_string())
+            .await
+            .map_err(|e| e.to_string())?;
+    }
+    Ok(id)
 }
 
 #[tauri::command]
-async fn save_embedding_config(
+async fn update_embedding_model(
     state: State<'_, AppState>,
+    id: i64,
+    name: String,
     provider: String,
     base_url: String,
     model: String,
@@ -1106,41 +1217,86 @@ async fn save_embedding_config(
     dimensions: Option<u32>,
     api_key: String,
 ) -> Result<(), String> {
-    storage::settings::set(&state.sqlite, "embedding.provider", &provider)
+    let m = storage::embedding_models::EmbeddingModel {
+        id: Some(id),
+        name,
+        provider,
+        base_url,
+        model,
+        deployment,
+        api_version,
+        dimensions: dimensions.map(|d| d as i64),
+        created_at: None,
+    };
+    storage::embedding_models::update(&state.sqlite, &m)
         .await
-        .map_err(|e| format!("save embedding provider failed: {e}"))?;
-    storage::settings::set(&state.sqlite, "embedding.base_url", &base_url)
-        .await
-        .map_err(|e| format!("save embedding base_url failed: {e}"))?;
-    storage::settings::set(&state.sqlite, "embedding.model", &model)
-        .await
-        .map_err(|e| format!("save embedding model failed: {e}"))?;
-    storage::settings::set(&state.sqlite, "embedding.deployment", &deployment)
-        .await
-        .map_err(|e| format!("save embedding deployment failed: {e}"))?;
-    storage::settings::set(&state.sqlite, "embedding.api_version", &api_version)
-        .await
-        .map_err(|e| format!("save embedding api_version failed: {e}"))?;
-    match dimensions {
-        Some(d) => storage::settings::set(
-            &state.sqlite,
-            "embedding.dimensions",
-            &d.to_string(),
-        )
-        .await
-        .map_err(|e| format!("save embedding dimensions failed: {e}"))?,
-        None => {
-            sqlx::query("DELETE FROM settings WHERE key = ?")
-                .bind("embedding.dimensions")
-                .execute(&state.sqlite)
-                .await
-                .map_err(|e| format!("clear embedding dimensions failed: {e}"))?;
-        }
-    }
+        .map_err(|e| e.to_string())?;
     if !api_key.is_empty() {
-        crypto::set_embedding_key(&state.sqlite, &api_key).await?;
+        crypto::set_embedding_model_key(&state.sqlite, id, &api_key).await?;
     }
     Ok(())
+}
+
+#[tauri::command]
+async fn delete_embedding_model(state: State<'_, AppState>, id: i64) -> Result<(), String> {
+    storage::embedding_models::delete_by_id(&state.sqlite, id)
+        .await
+        .map_err(|e| e.to_string())?;
+    crypto::delete_embedding_model_key(&state.sqlite, id).await?;
+    if active_embedding_model_id(&state.sqlite).await? == Some(id) {
+        sqlx::query("DELETE FROM settings WHERE key = ?")
+            .bind("embedding.active_model_id")
+            .execute(&state.sqlite)
+            .await
+            .map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
+#[tauri::command]
+async fn set_active_embedding_model(
+    state: State<'_, AppState>,
+    id: i64,
+) -> Result<(), String> {
+    storage::embedding_models::get_by_id(&state.sqlite, id)
+        .await
+        .map_err(|_| "model not found".to_string())?;
+    storage::settings::set(&state.sqlite, "embedding.active_model_id", &id.to_string())
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+#[derive(Serialize)]
+struct ActiveEmbeddingSummary {
+    id: Option<i64>,
+    name: Option<String>,
+    model: Option<String>,
+}
+
+#[tauri::command]
+async fn get_active_embedding_model(
+    state: State<'_, AppState>,
+) -> Result<ActiveEmbeddingSummary, String> {
+    match active_embedding_model_id(&state.sqlite).await? {
+        Some(id) => match storage::embedding_models::get_by_id(&state.sqlite, id).await {
+            Ok(m) => Ok(ActiveEmbeddingSummary {
+                id: Some(id),
+                name: Some(m.name),
+                model: Some(m.model),
+            }),
+            Err(_) => Ok(ActiveEmbeddingSummary {
+                id: None,
+                name: None,
+                model: None,
+            }),
+        },
+        None => Ok(ActiveEmbeddingSummary {
+            id: None,
+            name: None,
+            model: None,
+        }),
+    }
 }
 
 #[tauri::command]
@@ -1148,54 +1304,23 @@ async fn embed_text(
     state: State<'_, AppState>,
     text: String,
 ) -> Result<Vec<f32>, String> {
-    let provider = storage::settings::get(&state.sqlite, "embedding.provider")
-        .await
-        .map_err(|e| e.to_string())?
-        .unwrap_or_else(|| DEFAULT_EMBEDDING_PROVIDER.to_string());
-    let base_url = storage::settings::get(&state.sqlite, "embedding.base_url")
-        .await
-        .map_err(|e| e.to_string())?
-        .unwrap_or_else(|| DEFAULT_EMBEDDING_BASE_URL.to_string());
-    let model = storage::settings::get(&state.sqlite, "embedding.model")
-        .await
-        .map_err(|e| e.to_string())?
-        .unwrap_or_else(|| DEFAULT_EMBEDDING_MODEL.to_string());
-    let deployment = storage::settings::get(&state.sqlite, "embedding.deployment")
-        .await
-        .map_err(|e| e.to_string())?
-        .unwrap_or_default();
-    let api_version = storage::settings::get(&state.sqlite, "embedding.api_version")
-        .await
-        .map_err(|e| e.to_string())?
-        .unwrap_or_default();
-    let dimensions = storage::settings::get(&state.sqlite, "embedding.dimensions")
-        .await
-        .map_err(|e| e.to_string())?
-        .and_then(|s| s.parse::<u32>().ok());
-    let api_key = crypto::get_embedding_key(&state.sqlite).await?;
-    if api_key.is_empty() {
-        return Err(
-            "Embedding API key not configured. Open AI Settings → Embedding tab to set it."
-                .to_string(),
-        );
-    }
-
-    let provider_kind = match provider.as_str() {
+    let e = load_active_embedding(&state.sqlite).await?;
+    let provider_kind = match e.provider.as_str() {
         "azure" => {
-            if deployment.is_empty() {
+            if e.deployment.is_empty() {
                 return Err("Azure provider requires a deployment name.".to_string());
             }
-            if api_version.is_empty() {
+            if e.api_version.is_empty() {
                 return Err("Azure provider requires an api-version.".to_string());
             }
             embed::Provider::Azure {
-                deployment: &deployment,
-                api_version: &api_version,
+                deployment: &e.deployment,
+                api_version: &e.api_version,
             }
         }
-        _ => embed::Provider::OpenAi { model: &model },
+        _ => embed::Provider::OpenAi { model: &e.model },
     };
-    embed::embed(provider_kind, &base_url, &api_key, &text, dimensions).await
+    embed::embed(provider_kind, &e.base_url, &e.api_key, &text, e.dimensions).await
 }
 
 async fn build_schema_context(pool: &MySqlPool) -> Result<String, String> {
@@ -1253,18 +1378,7 @@ async fn generate_sql(
     current_sql: Option<String>,
     current_table: Option<String>,
 ) -> Result<String, String> {
-    let base_url = storage::settings::get(&state.sqlite, "ai.base_url")
-        .await
-        .map_err(|e| e.to_string())?
-        .unwrap_or_else(|| DEFAULT_AI_BASE_URL.to_string());
-    let model = storage::settings::get(&state.sqlite, "ai.model")
-        .await
-        .map_err(|e| e.to_string())?
-        .unwrap_or_else(|| DEFAULT_AI_MODEL.to_string());
-    let api_key = crypto::get_ai_key(&state.sqlite).await?;
-    if api_key.is_empty() {
-        return Err("API key not set. Open Settings (⚙) to configure.".into());
-    }
+    let (cfg, api_key) = load_active_ai(&state.sqlite).await?;
 
     let pool = state
         .active_pools
@@ -1277,7 +1391,7 @@ async fn generate_sql(
     let schema_context = build_schema_context(&pool).await?;
 
     ai::generate_sql(
-        &make_ai_config(&state.sqlite, base_url, model).await,
+        &cfg,
         &api_key,
         &schema_context,
         &prompt,
@@ -1330,18 +1444,7 @@ async fn generate_ai_relations(
     state: State<'_, AppState>,
     connection_id: i64,
 ) -> Result<analyze::AiRelationsReport, String> {
-    let base_url = storage::settings::get(&state.sqlite, "ai.base_url")
-        .await
-        .map_err(|e| e.to_string())?
-        .unwrap_or_else(|| DEFAULT_AI_BASE_URL.to_string());
-    let model = storage::settings::get(&state.sqlite, "ai.model")
-        .await
-        .map_err(|e| e.to_string())?
-        .unwrap_or_else(|| DEFAULT_AI_MODEL.to_string());
-    let api_key = crypto::get_ai_key(&state.sqlite).await?;
-    if api_key.is_empty() {
-        return Err("API key not set. Open Settings (⚙) to configure.".into());
-    }
+    let (cfg, api_key) = load_active_ai(&state.sqlite).await?;
 
     let pool = state
         .active_pools
@@ -1351,8 +1454,7 @@ async fn generate_ai_relations(
         .cloned()
         .ok_or_else(|| "Connection not open".to_string())?;
 
-    let config = make_ai_config(&state.sqlite, base_url, model).await;
-    analyze::generate_ai_relations(&pool, &state.sqlite, connection_id, &config, &api_key).await
+    analyze::generate_ai_relations(&pool, &state.sqlite, connection_id, &cfg, &api_key).await
 }
 
 #[tauri::command]
@@ -1361,18 +1463,7 @@ async fn generate_ai_relations_for_project(
     connection_id: i64,
     project_id: i64,
 ) -> Result<analyze::AiRelationsReport, String> {
-    let base_url = storage::settings::get(&state.sqlite, "ai.base_url")
-        .await
-        .map_err(|e| e.to_string())?
-        .unwrap_or_else(|| DEFAULT_AI_BASE_URL.to_string());
-    let model = storage::settings::get(&state.sqlite, "ai.model")
-        .await
-        .map_err(|e| e.to_string())?
-        .unwrap_or_else(|| DEFAULT_AI_MODEL.to_string());
-    let api_key = crypto::get_ai_key(&state.sqlite).await?;
-    if api_key.is_empty() {
-        return Err("API key not set. Open Settings (⚙) to configure.".into());
-    }
+    let (cfg, api_key) = load_active_ai(&state.sqlite).await?;
     let pool = state
         .active_pools
         .lock()
@@ -1380,13 +1471,12 @@ async fn generate_ai_relations_for_project(
         .get(&connection_id)
         .cloned()
         .ok_or_else(|| "Connection not open".to_string())?;
-    let config = make_ai_config(&state.sqlite, base_url, model).await;
     analyze::generate_ai_relations_for_project(
         &pool,
         &state.sqlite,
         project_id,
         connection_id,
-        &config,
+        &cfg,
         &api_key,
     )
     .await
@@ -1415,18 +1505,7 @@ async fn generate_table_comments(
     database: String,
     table: String,
 ) -> Result<analyze::TableCommentReport, String> {
-    let base_url = storage::settings::get(&state.sqlite, "ai.base_url")
-        .await
-        .map_err(|e| e.to_string())?
-        .unwrap_or_else(|| DEFAULT_AI_BASE_URL.to_string());
-    let model = storage::settings::get(&state.sqlite, "ai.model")
-        .await
-        .map_err(|e| e.to_string())?
-        .unwrap_or_else(|| DEFAULT_AI_MODEL.to_string());
-    let api_key = crypto::get_ai_key(&state.sqlite).await?;
-    if api_key.is_empty() {
-        return Err("API key not set. Open Settings (⚙) to configure.".into());
-    }
+    let (cfg, api_key) = load_active_ai(&state.sqlite).await?;
 
     let pool = state
         .active_pools
@@ -1436,14 +1515,13 @@ async fn generate_table_comments(
         .cloned()
         .ok_or_else(|| "Connection not open".to_string())?;
 
-    let config = make_ai_config(&state.sqlite, base_url, model).await;
     analyze::generate_table_comments(
         &pool,
         &state.sqlite,
         connection_id,
         &database,
         &table,
-        &config,
+        &cfg,
         &api_key,
     )
     .await
@@ -1951,18 +2029,7 @@ async fn suggest_chart(
     columns: Vec<query::ColumnMeta>,
     sample_rows: Vec<Vec<serde_json::Value>>,
 ) -> Result<ai::ChartConfig, String> {
-    let base_url = storage::settings::get(&state.sqlite, "ai.base_url")
-        .await
-        .map_err(|e| e.to_string())?
-        .unwrap_or_else(|| DEFAULT_AI_BASE_URL.to_string());
-    let model = storage::settings::get(&state.sqlite, "ai.model")
-        .await
-        .map_err(|e| e.to_string())?
-        .unwrap_or_else(|| DEFAULT_AI_MODEL.to_string());
-    let api_key = crypto::get_ai_key(&state.sqlite).await?;
-    if api_key.is_empty() {
-        return Err("API key not set. Open Settings (⚙) to configure.".into());
-    }
+    let (cfg, api_key) = load_active_ai(&state.sqlite).await?;
 
     let mut block = String::new();
     for c in &columns {
@@ -1985,8 +2052,7 @@ async fn suggest_chart(
     let sample_json = serde_json::to_string(&sample)
         .map_err(|e| format!("encode sample failed: {e}"))?;
 
-    let config = make_ai_config(&state.sqlite, base_url, model).await;
-    ai::suggest_chart(&config, &api_key, &block, &sample_json).await
+    ai::suggest_chart(&cfg, &api_key, &block, &sample_json).await
 }
 
 #[tauri::command]
@@ -1996,18 +2062,7 @@ async fn suggest_queries(
     database: String,
     table: String,
 ) -> Result<Vec<ai::QuerySuggestion>, String> {
-    let base_url = storage::settings::get(&state.sqlite, "ai.base_url")
-        .await
-        .map_err(|e| e.to_string())?
-        .unwrap_or_else(|| DEFAULT_AI_BASE_URL.to_string());
-    let model = storage::settings::get(&state.sqlite, "ai.model")
-        .await
-        .map_err(|e| e.to_string())?
-        .unwrap_or_else(|| DEFAULT_AI_MODEL.to_string());
-    let api_key = crypto::get_ai_key(&state.sqlite).await?;
-    if api_key.is_empty() {
-        return Err("API key not set. Open Settings (⚙) to configure.".into());
-    }
+    let (cfg, api_key) = load_active_ai(&state.sqlite).await?;
 
     let pool = state
         .active_pools
@@ -2067,8 +2122,7 @@ async fn suggest_queries(
         ));
     }
 
-    let config = make_ai_config(&state.sqlite, base_url, model).await;
-    let list = ai::suggest_queries(&config, &api_key, &database, &table, &block).await?;
+    let list = ai::suggest_queries(&cfg, &api_key, &database, &table, &block).await?;
     Ok(list.queries)
 }
 
@@ -2079,18 +2133,7 @@ async fn fix_sql_error(
     sql: String,
     error: String,
 ) -> Result<ai::SqlFixSuggestion, String> {
-    let base_url = storage::settings::get(&state.sqlite, "ai.base_url")
-        .await
-        .map_err(|e| e.to_string())?
-        .unwrap_or_else(|| DEFAULT_AI_BASE_URL.to_string());
-    let model = storage::settings::get(&state.sqlite, "ai.model")
-        .await
-        .map_err(|e| e.to_string())?
-        .unwrap_or_else(|| DEFAULT_AI_MODEL.to_string());
-    let api_key = crypto::get_ai_key(&state.sqlite).await?;
-    if api_key.is_empty() {
-        return Err("API key not set. Open Settings (⚙) to configure.".into());
-    }
+    let (cfg, api_key) = load_active_ai(&state.sqlite).await?;
 
     let pool = state
         .active_pools
@@ -2101,8 +2144,7 @@ async fn fix_sql_error(
         .ok_or_else(|| "Connection not open".to_string())?;
 
     let schema_context = build_schema_context(&pool).await?;
-    let config = make_ai_config(&state.sqlite, base_url, model).await;
-    ai::fix_sql_error(&config, &api_key, &schema_context, &sql, &error).await
+    ai::fix_sql_error(&cfg, &api_key, &schema_context, &sql, &error).await
 }
 
 #[tauri::command]
@@ -2278,24 +2320,15 @@ async fn explain_sql(
     let mut ai_error = None;
 
     if include_ai {
-        let base_url = storage::settings::get(&state.sqlite, "ai.base_url")
-            .await
-            .map_err(|e| e.to_string())?
-            .unwrap_or_else(|| DEFAULT_AI_BASE_URL.to_string());
-        let model = storage::settings::get(&state.sqlite, "ai.model")
-            .await
-            .map_err(|e| e.to_string())?
-            .unwrap_or_else(|| DEFAULT_AI_MODEL.to_string());
-        match crypto::get_ai_key(&state.sqlite).await {
-            Ok(api_key) if !api_key.is_empty() => {
+        match load_active_ai(&state.sqlite).await {
+            Ok((cfg, api_key)) => {
                 let json_str = serde_json::to_string(&plan.raw_json).unwrap_or_default();
-                let config = make_ai_config(&state.sqlite, base_url, model).await;
-                match ai::explain_query(&config, &api_key, &sql, &json_str).await {
+                match ai::explain_query(&cfg, &api_key, &sql, &json_str).await {
                     Ok(e) => explanation = Some(e),
                     Err(e) => ai_error = Some(e),
                 }
             }
-            _ => ai_error = Some("API key not set. Open Settings (⚙) to configure.".into()),
+            Err(e) => ai_error = Some(e),
         }
     }
 
@@ -2345,18 +2378,7 @@ async fn recommend_indexes(
     sql: String,
     tables: Vec<perf::InvolvedTableRef>,
 ) -> Result<ai::IndexRecommendations, String> {
-    let base_url = storage::settings::get(&state.sqlite, "ai.base_url")
-        .await
-        .map_err(|e| e.to_string())?
-        .unwrap_or_else(|| DEFAULT_AI_BASE_URL.to_string());
-    let model = storage::settings::get(&state.sqlite, "ai.model")
-        .await
-        .map_err(|e| e.to_string())?
-        .unwrap_or_else(|| DEFAULT_AI_MODEL.to_string());
-    let api_key = crypto::get_ai_key(&state.sqlite).await?;
-    if api_key.is_empty() {
-        return Err("API key not set. Open Settings (⚙) to configure.".into());
-    }
+    let (cfg, api_key) = load_active_ai(&state.sqlite).await?;
 
     let pool = state
         .active_pools
@@ -2389,8 +2411,7 @@ async fn recommend_indexes(
         }
     }
 
-    let config = make_ai_config(&state.sqlite, base_url, model).await;
-    ai::recommend_indexes(&config, &api_key, &sql, &block, &explain_json).await
+    ai::recommend_indexes(&cfg, &api_key, &sql, &block, &explain_json).await
 }
 
 #[tauri::command]
@@ -2477,26 +2498,14 @@ async fn assess_migrations(
     state: State<'_, AppState>,
     migrations: Vec<diff::MigrationStatement>,
 ) -> Result<ai::MigrationRiskReport, String> {
-    let base_url = storage::settings::get(&state.sqlite, "ai.base_url")
-        .await
-        .map_err(|e| e.to_string())?
-        .unwrap_or_else(|| DEFAULT_AI_BASE_URL.to_string());
-    let model = storage::settings::get(&state.sqlite, "ai.model")
-        .await
-        .map_err(|e| e.to_string())?
-        .unwrap_or_else(|| DEFAULT_AI_MODEL.to_string());
-    let api_key = crypto::get_ai_key(&state.sqlite).await?;
-    if api_key.is_empty() {
-        return Err("API key not set. Open Settings (⚙) to configure.".into());
-    }
+    let (cfg, api_key) = load_active_ai(&state.sqlite).await?;
 
     let mut block = String::new();
     for (i, m) in migrations.iter().enumerate() {
         block.push_str(&format!("{i}. [{}] {}\n", m.kind, m.sql));
     }
 
-    let config = make_ai_config(&state.sqlite, base_url, model).await;
-    ai::assess_migrations(&config, &api_key, &block).await
+    ai::assess_migrations(&cfg, &api_key, &block).await
 }
 
 #[derive(Serialize)]
@@ -2526,24 +2535,15 @@ async fn run_health_check(
     let mut ai_error = None;
 
     if include_ai {
-        let base_url = storage::settings::get(&state.sqlite, "ai.base_url")
-            .await
-            .map_err(|e| e.to_string())?
-            .unwrap_or_else(|| DEFAULT_AI_BASE_URL.to_string());
-        let model = storage::settings::get(&state.sqlite, "ai.model")
-            .await
-            .map_err(|e| e.to_string())?
-            .unwrap_or_else(|| DEFAULT_AI_MODEL.to_string());
-        match crypto::get_ai_key(&state.sqlite).await {
-            Ok(api_key) if !api_key.is_empty() => {
+        match load_active_ai(&state.sqlite).await {
+            Ok((cfg, api_key)) => {
                 let summary = build_health_summary(&report);
-                let config = make_ai_config(&state.sqlite, base_url, model).await;
-                match ai::health_overview(&config, &api_key, &summary).await {
+                match ai::health_overview(&cfg, &api_key, &summary).await {
                     Ok(o) => ai_overview = Some(o),
                     Err(e) => ai_error = Some(e),
                 }
             }
-            _ => ai_error = Some("API key not set. Open Settings (⚙) to configure.".into()),
+            Err(e) => ai_error = Some(e),
         }
     }
 
@@ -2670,24 +2670,15 @@ async fn run_onboarding(
         if snapshot.tables.is_empty() {
             ai_error = Some("Database has no tables to analyze.".into());
         } else {
-            let base_url = storage::settings::get(&state.sqlite, "ai.base_url")
-                .await
-                .map_err(|e| e.to_string())?
-                .unwrap_or_else(|| DEFAULT_AI_BASE_URL.to_string());
-            let model = storage::settings::get(&state.sqlite, "ai.model")
-                .await
-                .map_err(|e| e.to_string())?
-                .unwrap_or_else(|| DEFAULT_AI_MODEL.to_string());
-            match crypto::get_ai_key(&state.sqlite).await {
-                Ok(api_key) if !api_key.is_empty() => {
+            match load_active_ai(&state.sqlite).await {
+                Ok((cfg, api_key)) => {
                     let block = build_onboarding_block(&snapshot);
-                    let config = make_ai_config(&state.sqlite, base_url, model).await;
-                    match ai::onboarding_analysis(&config, &api_key, &block).await {
+                    match ai::onboarding_analysis(&cfg, &api_key, &block).await {
                         Ok(r) => report = Some(r),
                         Err(e) => ai_error = Some(e),
                     }
                 }
-                _ => ai_error = Some("API key not set. Open Settings (⚙) to configure.".into()),
+                Err(e) => ai_error = Some(e),
             }
         }
     }
@@ -2788,24 +2779,15 @@ async fn run_impact_analysis(
     let mut ai_error = None;
 
     if include_ai {
-        let base_url = storage::settings::get(&state.sqlite, "ai.base_url")
-            .await
-            .map_err(|e| e.to_string())?
-            .unwrap_or_else(|| DEFAULT_AI_BASE_URL.to_string());
-        let model = storage::settings::get(&state.sqlite, "ai.model")
-            .await
-            .map_err(|e| e.to_string())?
-            .unwrap_or_else(|| DEFAULT_AI_MODEL.to_string());
-        match crypto::get_ai_key(&state.sqlite).await {
-            Ok(api_key) if !api_key.is_empty() => {
+        match load_active_ai(&state.sqlite).await {
+            Ok((cfg, api_key)) => {
                 let block = build_impact_block(&report);
-                let config = make_ai_config(&state.sqlite, base_url, model).await;
-                match ai::impact_analysis(&config, &api_key, &block).await {
+                match ai::impact_analysis(&cfg, &api_key, &block).await {
                     Ok(a) => assessment = Some(a),
                     Err(e) => ai_error = Some(e),
                 }
             }
-            _ => ai_error = Some("API key not set. Open Settings (⚙) to configure.".into()),
+            Err(e) => ai_error = Some(e),
         }
     }
 
@@ -2934,24 +2916,15 @@ async fn run_project_impact(
     let mut ai_error = None;
 
     if include_ai {
-        let base_url = storage::settings::get(&state.sqlite, "ai.base_url")
-            .await
-            .map_err(|e| e.to_string())?
-            .unwrap_or_else(|| DEFAULT_AI_BASE_URL.to_string());
-        let model = storage::settings::get(&state.sqlite, "ai.model")
-            .await
-            .map_err(|e| e.to_string())?
-            .unwrap_or_else(|| DEFAULT_AI_MODEL.to_string());
-        match crypto::get_ai_key(&state.sqlite).await {
-            Ok(api_key) if !api_key.is_empty() => {
+        match load_active_ai(&state.sqlite).await {
+            Ok((cfg, api_key)) => {
                 let block = build_project_impact_block(&report);
-                let config = make_ai_config(&state.sqlite, base_url, model).await;
-                match ai::impact_analysis(&config, &api_key, &block).await {
+                match ai::impact_analysis(&cfg, &api_key, &block).await {
                     Ok(a) => assessment = Some(a),
                     Err(e) => ai_error = Some(e),
                 }
             }
-            _ => ai_error = Some("API key not set. Open Settings (⚙) to configure.".into()),
+            Err(e) => ai_error = Some(e),
         }
     }
 
@@ -3107,24 +3080,15 @@ async fn run_project_health_check(
     let mut ai_error = None;
 
     if include_ai {
-        let base_url = storage::settings::get(&state.sqlite, "ai.base_url")
-            .await
-            .map_err(|e| e.to_string())?
-            .unwrap_or_else(|| DEFAULT_AI_BASE_URL.to_string());
-        let model = storage::settings::get(&state.sqlite, "ai.model")
-            .await
-            .map_err(|e| e.to_string())?
-            .unwrap_or_else(|| DEFAULT_AI_MODEL.to_string());
-        match crypto::get_ai_key(&state.sqlite).await {
-            Ok(api_key) if !api_key.is_empty() => {
+        match load_active_ai(&state.sqlite).await {
+            Ok((cfg, api_key)) => {
                 let summary = build_project_health_summary(&report);
-                let config = make_ai_config(&state.sqlite, base_url, model).await;
-                match ai::health_overview(&config, &api_key, &summary).await {
+                match ai::health_overview(&cfg, &api_key, &summary).await {
                     Ok(o) => ai_overview = Some(o),
                     Err(e) => ai_error = Some(e),
                 }
             }
-            _ => ai_error = Some("API key not set. Open Settings (⚙) to configure.".into()),
+            Err(e) => ai_error = Some(e),
         }
     }
 
@@ -3267,24 +3231,15 @@ async fn run_project_briefing(
         if snapshot.tables.is_empty() {
             ai_error = Some("Project has no tables yet. Add tables in Edit project.".into());
         } else {
-            let base_url = storage::settings::get(&state.sqlite, "ai.base_url")
-                .await
-                .map_err(|e| e.to_string())?
-                .unwrap_or_else(|| DEFAULT_AI_BASE_URL.to_string());
-            let model = storage::settings::get(&state.sqlite, "ai.model")
-                .await
-                .map_err(|e| e.to_string())?
-                .unwrap_or_else(|| DEFAULT_AI_MODEL.to_string());
-            match crypto::get_ai_key(&state.sqlite).await {
-                Ok(api_key) if !api_key.is_empty() => {
+            match load_active_ai(&state.sqlite).await {
+                Ok((cfg, api_key)) => {
                     let block = build_briefing_block(&snapshot);
-                    let config = make_ai_config(&state.sqlite, base_url, model).await;
-                    match ai::project_briefing(&config, &api_key, &block).await {
+                    match ai::project_briefing(&cfg, &api_key, &block).await {
                         Ok(r) => report = Some(r),
                         Err(e) => ai_error = Some(e),
                     }
                 }
-                _ => ai_error = Some("API key not set. Open Settings (⚙) to configure.".into()),
+                Err(e) => ai_error = Some(e),
             }
         }
     }
@@ -3395,52 +3350,185 @@ fn build_briefing_block(s: &agent::ProjectBriefingSnapshot) -> String {
     out
 }
 
-async fn read_enable_thinking(pool: &sqlx::SqlitePool) -> Result<Option<bool>, String> {
-    let v = storage::settings::get(pool, "ai.enable_thinking")
-        .await
-        .map_err(|e| e.to_string())?;
-    Ok(v.map(|s| s == "1" || s.eq_ignore_ascii_case("true")))
-}
-
-/// Construct an `AiConfig` given base_url + model already in scope, attaching the
-/// user's persisted thinking-mode preference. All inline `AiConfig` constructions
-/// in Tauri commands must go through this — otherwise the thinking switch silently
-/// stops working for that caller (drift risk, per AUTO-MEMORY rule on shared funcs).
-async fn make_ai_config(
+/// Load the user's active AI model — base_url / model / api_key / thinking — for
+/// any LLM call. All inline reads of `ai.base_url` / `ai.model` / `get_ai_key`
+/// were replaced with this helper so adding / removing fields stays single-source.
+async fn load_active_ai(
     pool: &sqlx::SqlitePool,
-    base_url: String,
-    model: String,
-) -> ai::AiConfig {
-    let enable_thinking = read_enable_thinking(pool).await.ok().flatten();
-    ai::AiConfig {
-        base_url,
-        model,
-        enable_thinking,
-    }
-}
-
-async fn ai_config_or_err(state: &State<'_, AppState>) -> Result<(ai::AiConfig, String), String> {
-    let base_url = storage::settings::get(&state.sqlite, "ai.base_url")
-        .await
-        .map_err(|e| e.to_string())?
-        .unwrap_or_else(|| DEFAULT_AI_BASE_URL.to_string());
-    let model = storage::settings::get(&state.sqlite, "ai.model")
-        .await
-        .map_err(|e| e.to_string())?
-        .unwrap_or_else(|| DEFAULT_AI_MODEL.to_string());
-    let enable_thinking = read_enable_thinking(&state.sqlite).await?;
-    let api_key = crypto::get_ai_key(&state.sqlite).await?;
+) -> Result<(ai::AiConfig, String), String> {
+    let id = active_ai_model_id(pool)
+        .await?
+        .ok_or_else(|| "No active AI model. Open Settings (⚙) → Chat to add one.".to_string())?;
+    let m = storage::ai_models::get_by_id(pool, id).await.map_err(|_| {
+        "Active AI model not found. Open Settings (⚙) → Chat to set one.".to_string()
+    })?;
+    let api_key = crypto::get_ai_model_key(pool, id).await?;
     if api_key.is_empty() {
-        return Err("API key not set. Open Settings (⚙) to configure.".into());
+        return Err(format!(
+            "API key not set for model '{}'. Open Settings (⚙) → Chat.",
+            m.name
+        ));
     }
+    let enable_thinking = m.enable_thinking.map(|v| v != 0);
     Ok((
         ai::AiConfig {
-            base_url,
-            model,
+            base_url: m.base_url,
+            model: m.model,
             enable_thinking,
         },
         api_key,
     ))
+}
+
+pub struct ActiveEmbedding {
+    pub provider: String,
+    pub base_url: String,
+    pub model: String,
+    pub deployment: String,
+    pub api_version: String,
+    pub dimensions: Option<u32>,
+    pub api_key: String,
+}
+
+async fn load_active_embedding(pool: &sqlx::SqlitePool) -> Result<ActiveEmbedding, String> {
+    let id = active_embedding_model_id(pool)
+        .await?
+        .ok_or_else(|| {
+            "No active embedding model. Open Settings (⚙) → Embedding to add one.".to_string()
+        })?;
+    let m = storage::embedding_models::get_by_id(pool, id)
+        .await
+        .map_err(|_| {
+            "Active embedding model not found. Open Settings (⚙) → Embedding to set one."
+                .to_string()
+        })?;
+    let api_key = crypto::get_embedding_model_key(pool, id).await?;
+    if api_key.is_empty() {
+        return Err(format!(
+            "API key not set for embedding model '{}'. Open Settings (⚙) → Embedding.",
+            m.name
+        ));
+    }
+    Ok(ActiveEmbedding {
+        provider: m.provider,
+        base_url: m.base_url,
+        model: m.model,
+        deployment: m.deployment,
+        api_version: m.api_version,
+        dimensions: m.dimensions.and_then(|d| u32::try_from(d).ok()),
+        api_key,
+    })
+}
+
+async fn active_ai_model_id(pool: &sqlx::SqlitePool) -> Result<Option<i64>, String> {
+    Ok(storage::settings::get(pool, "ai.active_model_id")
+        .await
+        .map_err(|e| e.to_string())?
+        .and_then(|s| s.parse().ok()))
+}
+
+async fn active_embedding_model_id(pool: &sqlx::SqlitePool) -> Result<Option<i64>, String> {
+    Ok(storage::settings::get(pool, "embedding.active_model_id")
+        .await
+        .map_err(|e| e.to_string())?
+        .and_then(|s| s.parse().ok()))
+}
+
+/// On first run after upgrade, copy the legacy single `ai.*` settings + keychain
+/// blob into an `ai_models` row named "Default" and mark it active. Same for
+/// embedding. Idempotent: no-op once `ai_models` / `embedding_models` is non-empty.
+async fn migrate_legacy_ai_models(pool: &sqlx::SqlitePool) -> Result<(), String> {
+    if storage::ai_models::count(pool).await.map_err(|e| e.to_string())? == 0 {
+        let base_url_opt = storage::settings::get(pool, "ai.base_url")
+            .await
+            .map_err(|e| e.to_string())?;
+        let legacy_key = crypto::get_ai_key(pool).await?;
+        if base_url_opt.is_some() || !legacy_key.is_empty() {
+            let model = storage::settings::get(pool, "ai.model")
+                .await
+                .map_err(|e| e.to_string())?
+                .unwrap_or_else(|| DEFAULT_AI_MODEL.to_string());
+            let enable_thinking = storage::settings::get(pool, "ai.enable_thinking")
+                .await
+                .map_err(|e| e.to_string())?
+                .and_then(|s| match s.as_str() {
+                    "1" => Some(1i64),
+                    "0" => Some(0i64),
+                    _ => None,
+                });
+            let m = storage::ai_models::AiModel {
+                id: None,
+                name: "Default".to_string(),
+                base_url: base_url_opt.unwrap_or_else(|| DEFAULT_AI_BASE_URL.to_string()),
+                model,
+                enable_thinking,
+                created_at: None,
+            };
+            let id = storage::ai_models::insert(pool, &m)
+                .await
+                .map_err(|e| e.to_string())?;
+            if !legacy_key.is_empty() {
+                crypto::set_ai_model_key(pool, id, &legacy_key).await?;
+            }
+            storage::settings::set(pool, "ai.active_model_id", &id.to_string())
+                .await
+                .map_err(|e| e.to_string())?;
+        }
+    }
+
+    if storage::embedding_models::count(pool)
+        .await
+        .map_err(|e| e.to_string())?
+        == 0
+    {
+        let base_url_opt = storage::settings::get(pool, "embedding.base_url")
+            .await
+            .map_err(|e| e.to_string())?;
+        let legacy_key = crypto::get_embedding_key(pool).await?;
+        if base_url_opt.is_some() || !legacy_key.is_empty() {
+            let provider = storage::settings::get(pool, "embedding.provider")
+                .await
+                .map_err(|e| e.to_string())?
+                .unwrap_or_else(|| DEFAULT_EMBEDDING_PROVIDER.to_string());
+            let model = storage::settings::get(pool, "embedding.model")
+                .await
+                .map_err(|e| e.to_string())?
+                .unwrap_or_else(|| DEFAULT_EMBEDDING_MODEL.to_string());
+            let deployment = storage::settings::get(pool, "embedding.deployment")
+                .await
+                .map_err(|e| e.to_string())?
+                .unwrap_or_default();
+            let api_version = storage::settings::get(pool, "embedding.api_version")
+                .await
+                .map_err(|e| e.to_string())?
+                .unwrap_or_default();
+            let dimensions = storage::settings::get(pool, "embedding.dimensions")
+                .await
+                .map_err(|e| e.to_string())?
+                .and_then(|s| s.parse::<i64>().ok());
+            let m = storage::embedding_models::EmbeddingModel {
+                id: None,
+                name: "Default".to_string(),
+                provider,
+                base_url: base_url_opt.unwrap_or_else(|| DEFAULT_EMBEDDING_BASE_URL.to_string()),
+                model,
+                deployment,
+                api_version,
+                dimensions,
+                created_at: None,
+            };
+            let id = storage::embedding_models::insert(pool, &m)
+                .await
+                .map_err(|e| e.to_string())?;
+            if !legacy_key.is_empty() {
+                crypto::set_embedding_model_key(pool, id, &legacy_key).await?;
+            }
+            storage::settings::set(pool, "embedding.active_model_id", &id.to_string())
+                .await
+                .map_err(|e| e.to_string())?;
+        }
+    }
+    Ok(())
 }
 
 async fn require_mysql_pool(
@@ -3463,7 +3551,7 @@ async fn repair_start(
     goal: String,
 ) -> Result<storage::repair::RepairSession, String> {
     let mysql = require_mysql_pool(&state, connection_id).await?;
-    let (cfg, key) = ai_config_or_err(&state).await?;
+    let (cfg, key) = load_active_ai(&state.sqlite).await?;
     agent::repair::start_session(
         &state.sqlite,
         &mysql,
@@ -3486,7 +3574,7 @@ async fn repair_propose_strategy(
         .await
         .map_err(|e| format!("session not found: {e}"))?;
     let mysql = require_mysql_pool(&state, session.connection_id).await?;
-    let (cfg, key) = ai_config_or_err(&state).await?;
+    let (cfg, key) = load_active_ai(&state.sqlite).await?;
     agent::repair::propose_strategy(&state.sqlite, &mysql, &cfg, &key, session_id).await
 }
 
@@ -3590,27 +3678,18 @@ async fn run_project_schema_diff(
     let mut ai_error = None;
 
     if include_ai && !report.diff.migrations.is_empty() {
-        let base_url = storage::settings::get(&state.sqlite, "ai.base_url")
-            .await
-            .map_err(|e| e.to_string())?
-            .unwrap_or_else(|| DEFAULT_AI_BASE_URL.to_string());
-        let model = storage::settings::get(&state.sqlite, "ai.model")
-            .await
-            .map_err(|e| e.to_string())?
-            .unwrap_or_else(|| DEFAULT_AI_MODEL.to_string());
-        match crypto::get_ai_key(&state.sqlite).await {
-            Ok(api_key) if !api_key.is_empty() => {
+        match load_active_ai(&state.sqlite).await {
+            Ok((cfg, api_key)) => {
                 let mut block = String::new();
                 for (i, m) in report.diff.migrations.iter().enumerate() {
                     block.push_str(&format!("{i}. [{}] {}\n", m.kind, m.sql));
                 }
-                let config = make_ai_config(&state.sqlite, base_url, model).await;
-                match ai::assess_migrations(&config, &api_key, &block).await {
+                match ai::assess_migrations(&cfg, &api_key, &block).await {
                     Ok(r) => risk = Some(r),
                     Err(e) => ai_error = Some(e),
                 }
             }
-            _ => ai_error = Some("API key not set. Open Settings (⚙) to configure.".into()),
+            Err(e) => ai_error = Some(e),
         }
     } else if include_ai {
         ai_error = Some("No migrations generated — AI risk assessment skipped.".into());
@@ -3658,24 +3737,15 @@ async fn run_project_slow_queries(
     let mut ai_error = None;
 
     if include_ai {
-        let base_url = storage::settings::get(&state.sqlite, "ai.base_url")
-            .await
-            .map_err(|e| e.to_string())?
-            .unwrap_or_else(|| DEFAULT_AI_BASE_URL.to_string());
-        let model = storage::settings::get(&state.sqlite, "ai.model")
-            .await
-            .map_err(|e| e.to_string())?
-            .unwrap_or_else(|| DEFAULT_AI_MODEL.to_string());
-        match crypto::get_ai_key(&state.sqlite).await {
-            Ok(api_key) if !api_key.is_empty() => {
+        match load_active_ai(&state.sqlite).await {
+            Ok((cfg, api_key)) => {
                 let block = build_project_slow_block(&report);
-                let config = make_ai_config(&state.sqlite, base_url, model).await;
-                match ai::project_slow_overview(&config, &api_key, &block).await {
+                match ai::project_slow_overview(&cfg, &api_key, &block).await {
                     Ok(o) => ai_overview = Some(o),
                     Err(e) => ai_error = Some(e),
                 }
             }
-            _ => ai_error = Some("API key not set. Open Settings (⚙) to configure.".into()),
+            Err(e) => ai_error = Some(e),
         }
     }
 
@@ -3776,24 +3846,15 @@ async fn export_project_dictionary(
         if snapshot.tables.is_empty() {
             ai_error = Some("Project has no tables yet. Add tables in Edit project.".into());
         } else {
-            let base_url = storage::settings::get(&state.sqlite, "ai.base_url")
-                .await
-                .map_err(|e| e.to_string())?
-                .unwrap_or_else(|| DEFAULT_AI_BASE_URL.to_string());
-            let model = storage::settings::get(&state.sqlite, "ai.model")
-                .await
-                .map_err(|e| e.to_string())?
-                .unwrap_or_else(|| DEFAULT_AI_MODEL.to_string());
-            match crypto::get_ai_key(&state.sqlite).await {
-                Ok(api_key) if !api_key.is_empty() => {
+            match load_active_ai(&state.sqlite).await {
+                Ok((cfg, api_key)) => {
                     let block = build_dictionary_block(&snapshot);
-                    let config = make_ai_config(&state.sqlite, base_url, model).await;
-                    match ai::project_dictionary_summary(&config, &api_key, &block).await {
+                    match ai::project_dictionary_summary(&cfg, &api_key, &block).await {
                         Ok(s) => ai_summary = Some(s),
                         Err(e) => ai_error = Some(e),
                     }
                 }
-                _ => ai_error = Some("API key not set. Open Settings (⚙) to configure.".into()),
+                Err(e) => ai_error = Some(e),
             }
         }
     }
@@ -3957,24 +4018,15 @@ async fn export_connection_er(
         if snapshot.tables.is_empty() {
             ai_error = Some("No tables in scope.".into());
         } else {
-            let base_url = storage::settings::get(&state.sqlite, "ai.base_url")
-                .await
-                .map_err(|e| e.to_string())?
-                .unwrap_or_else(|| DEFAULT_AI_BASE_URL.to_string());
-            let model = storage::settings::get(&state.sqlite, "ai.model")
-                .await
-                .map_err(|e| e.to_string())?
-                .unwrap_or_else(|| DEFAULT_AI_MODEL.to_string());
-            match crypto::get_ai_key(&state.sqlite).await {
-                Ok(api_key) if !api_key.is_empty() => {
+            match load_active_ai(&state.sqlite).await {
+                Ok((cfg, api_key)) => {
                     let block = er::build_ai_block(&snapshot);
-                    let config = make_ai_config(&state.sqlite, base_url, model).await;
-                    match ai::er_diagram_overview(&config, &api_key, &block).await {
+                    match ai::er_diagram_overview(&cfg, &api_key, &block).await {
                         Ok(s) => ai_overview = Some(s),
                         Err(e) => ai_error = Some(e),
                     }
                 }
-                _ => ai_error = Some("API key not set. Open Settings (⚙) to configure.".into()),
+                Err(e) => ai_error = Some(e),
             }
         }
     }
@@ -4007,24 +4059,15 @@ async fn export_project_er(
         if snapshot.tables.is_empty() {
             ai_error = Some("Project has no tables yet. Add tables in Edit project.".into());
         } else {
-            let base_url = storage::settings::get(&state.sqlite, "ai.base_url")
-                .await
-                .map_err(|e| e.to_string())?
-                .unwrap_or_else(|| DEFAULT_AI_BASE_URL.to_string());
-            let model = storage::settings::get(&state.sqlite, "ai.model")
-                .await
-                .map_err(|e| e.to_string())?
-                .unwrap_or_else(|| DEFAULT_AI_MODEL.to_string());
-            match crypto::get_ai_key(&state.sqlite).await {
-                Ok(api_key) if !api_key.is_empty() => {
+            match load_active_ai(&state.sqlite).await {
+                Ok((cfg, api_key)) => {
                     let block = er::build_ai_block(&snapshot);
-                    let config = make_ai_config(&state.sqlite, base_url, model).await;
-                    match ai::er_diagram_overview(&config, &api_key, &block).await {
+                    match ai::er_diagram_overview(&cfg, &api_key, &block).await {
                         Ok(s) => ai_overview = Some(s),
                         Err(e) => ai_error = Some(e),
                     }
                 }
-                _ => ai_error = Some("API key not set. Open Settings (⚙) to configure.".into()),
+                Err(e) => ai_error = Some(e),
             }
         }
     }
@@ -4083,24 +4126,15 @@ async fn analyze_deadlock(
 
     if include_ai {
         if let Some(rep) = &report {
-            let base_url = storage::settings::get(&state.sqlite, "ai.base_url")
-                .await
-                .map_err(|e| e.to_string())?
-                .unwrap_or_else(|| DEFAULT_AI_BASE_URL.to_string());
-            let model = storage::settings::get(&state.sqlite, "ai.model")
-                .await
-                .map_err(|e| e.to_string())?
-                .unwrap_or_else(|| DEFAULT_AI_MODEL.to_string());
-            match crypto::get_ai_key(&state.sqlite).await {
-                Ok(api_key) if !api_key.is_empty() => {
+            match load_active_ai(&state.sqlite).await {
+                Ok((cfg, api_key)) => {
                     let block = deadlock::build_ai_block(rep);
-                    let config = make_ai_config(&state.sqlite, base_url, model).await;
-                    match ai::analyze_deadlock(&config, &api_key, &block).await {
+                    match ai::analyze_deadlock(&cfg, &api_key, &block).await {
                         Ok(a) => ai_analysis = Some(a),
                         Err(e) => ai_error = Some(e),
                     }
                 }
-                _ => ai_error = Some("API key not set. Open Settings (⚙) to configure.".into()),
+                Err(e) => ai_error = Some(e),
             }
         }
     }
@@ -4246,6 +4280,12 @@ pub fn run() {
                 storage::init_pool(&db_path).await
             })?;
 
+            if let Err(e) = tauri::async_runtime::block_on(async {
+                migrate_legacy_ai_models(&pool).await
+            }) {
+                eprintln!("[migration] legacy ai/embedding migration failed: {e}");
+            }
+
             let active_pools = Arc::new(Mutex::new(HashMap::<i64, MySqlPool>::new()));
 
             // Seed allowlist from SQLite on boot so the Tauri command and the
@@ -4321,10 +4361,18 @@ pub fn run() {
             delete_rows,
             list_databases,
             list_tables,
-            get_ai_config,
-            save_ai_config,
-            get_embedding_config,
-            save_embedding_config,
+            list_ai_models,
+            create_ai_model,
+            update_ai_model,
+            delete_ai_model,
+            set_active_ai_model,
+            get_active_ai_model,
+            list_embedding_models,
+            create_embedding_model,
+            update_embedding_model,
+            delete_embedding_model,
+            set_active_embedding_model,
+            get_active_embedding_model,
             embed_text,
             generate_sql,
             list_history,

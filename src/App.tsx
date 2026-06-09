@@ -3,6 +3,8 @@ import { invoke } from "@tauri-apps/api/core";
 import {
   emptyConnection,
   SYSTEM_DBS,
+  type ActiveAiSummary,
+  type ActiveEmbeddingSummary,
   type Annotation,
   type ColumnMetaForTree,
   type Connection,
@@ -106,6 +108,10 @@ function App() {
   const initialInjection = INITIAL_INJECTION;
 
   const [showSettings, setShowSettings] = useState(false);
+  const [activeAiName, setActiveAiName] = useState<string | null>(null);
+  const [activeEmbeddingName, setActiveEmbeddingName] = useState<string | null>(
+    null,
+  );
   const [history, setHistory] = useState<HistoryEntry[]>([]);
 
   const [annotations, setAnnotations] = useState<Annotation[]>([]);
@@ -158,9 +164,23 @@ function App() {
   // re-reads tables / relations without remounting.
   const [projectRefreshKey, setProjectRefreshKey] = useState(0);
 
+  async function refreshActiveModels() {
+    try {
+      const [ai, emb] = await Promise.all([
+        invoke<ActiveAiSummary>("get_active_ai_model"),
+        invoke<ActiveEmbeddingSummary>("get_active_embedding_model"),
+      ]);
+      setActiveAiName(ai.name);
+      setActiveEmbeddingName(emb.name);
+    } catch {
+      // Statusbar pill is optional — swallow rather than break the UI.
+    }
+  }
+
   useEffect(() => {
     void refresh();
     void refreshProjects();
+    void refreshActiveModels();
   }, []);
 
   useEffect(() => {
@@ -1330,9 +1350,18 @@ function App() {
         projectTableCount={projectStats.tableCount}
         projectConnsOpen={projectStats.connsOpen}
         projectConnsTotal={projectStats.connsTotal}
+        activeAiName={activeAiName}
+        activeEmbeddingName={activeEmbeddingName}
       />
 
-      {showSettings && <SettingsModal onClose={() => setShowSettings(false)} />}
+      {showSettings && (
+        <SettingsModal
+          onClose={() => {
+            setShowSettings(false);
+            void refreshActiveModels();
+          }}
+        />
+      )}
       {editingProject && (
         <ProjectEditorModal
           project={editingProject}

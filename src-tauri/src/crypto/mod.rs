@@ -111,28 +111,55 @@ pub async fn delete_password(pool: &SqlitePool, id: i64) -> Result<(), String> {
     drop_key(pool, &format!("conn:{id}")).await
 }
 
-pub async fn set_ai_key(pool: &SqlitePool, key: &str) -> Result<(), String> {
-    put(pool, AI_KEY, key).await
-}
-
+/// Legacy single-slot AI key. Retained only so `migrate_legacy_ai_models` can read
+/// it on first launch after upgrade. Everywhere else uses `*_ai_model_key(id, …)`.
 pub async fn get_ai_key(pool: &SqlitePool) -> Result<String, String> {
     Ok(fetch(pool, AI_KEY).await?.unwrap_or_default())
 }
 
-pub async fn has_ai_key(pool: &SqlitePool) -> bool {
-    matches!(get_ai_key(pool).await, Ok(ref s) if !s.is_empty())
-}
-
-pub async fn set_embedding_key(pool: &SqlitePool, key: &str) -> Result<(), String> {
-    put(pool, EMBEDDING_KEY, key).await
-}
-
+/// Same story for the legacy embedding key.
 pub async fn get_embedding_key(pool: &SqlitePool) -> Result<String, String> {
     Ok(fetch(pool, EMBEDDING_KEY).await?.unwrap_or_default())
 }
 
-pub async fn has_embedding_key(pool: &SqlitePool) -> bool {
-    matches!(get_embedding_key(pool).await, Ok(ref s) if !s.is_empty())
+pub async fn set_ai_model_key(pool: &SqlitePool, id: i64, key: &str) -> Result<(), String> {
+    put(pool, &format!("ai:apikey:{id}"), key).await
+}
+
+pub async fn get_ai_model_key(pool: &SqlitePool, id: i64) -> Result<String, String> {
+    Ok(fetch(pool, &format!("ai:apikey:{id}"))
+        .await?
+        .unwrap_or_default())
+}
+
+pub async fn has_ai_model_key(pool: &SqlitePool, id: i64) -> bool {
+    matches!(get_ai_model_key(pool, id).await, Ok(ref s) if !s.is_empty())
+}
+
+pub async fn delete_ai_model_key(pool: &SqlitePool, id: i64) -> Result<(), String> {
+    drop_key(pool, &format!("ai:apikey:{id}")).await
+}
+
+pub async fn set_embedding_model_key(
+    pool: &SqlitePool,
+    id: i64,
+    key: &str,
+) -> Result<(), String> {
+    put(pool, &format!("embedding:apikey:{id}"), key).await
+}
+
+pub async fn get_embedding_model_key(pool: &SqlitePool, id: i64) -> Result<String, String> {
+    Ok(fetch(pool, &format!("embedding:apikey:{id}"))
+        .await?
+        .unwrap_or_default())
+}
+
+pub async fn has_embedding_model_key(pool: &SqlitePool, id: i64) -> bool {
+    matches!(get_embedding_model_key(pool, id).await, Ok(ref s) if !s.is_empty())
+}
+
+pub async fn delete_embedding_model_key(pool: &SqlitePool, id: i64) -> Result<(), String> {
+    drop_key(pool, &format!("embedding:apikey:{id}")).await
 }
 
 pub fn generate_mcp_token() -> String {

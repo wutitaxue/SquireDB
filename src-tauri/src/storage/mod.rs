@@ -3,9 +3,11 @@ use sqlx::SqlitePool;
 use std::path::Path;
 use std::str::FromStr;
 
+pub mod ai_models;
 pub mod annotation;
 pub mod connection;
 pub mod drill_history;
+pub mod embedding_models;
 pub mod history;
 pub mod mcp_settings;
 pub mod project;
@@ -265,6 +267,39 @@ async fn init_schema(pool: &SqlitePool) -> Result<(), sqlx::Error> {
     sqlx::query(
         "CREATE INDEX IF NOT EXISTS idx_repair_sessions_conn \
          ON repair_sessions(connection_id, id DESC)",
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS ai_models (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL,
+            base_url TEXT NOT NULL,
+            model TEXT NOT NULL,
+            enable_thinking INTEGER,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        )
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS embedding_models (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL,
+            provider TEXT NOT NULL DEFAULT 'openai',
+            base_url TEXT NOT NULL,
+            model TEXT NOT NULL DEFAULT '',
+            deployment TEXT NOT NULL DEFAULT '',
+            api_version TEXT NOT NULL DEFAULT '',
+            dimensions INTEGER,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        )
+        "#,
     )
     .execute(pool)
     .await?;

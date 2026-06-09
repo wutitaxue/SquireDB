@@ -1,9 +1,9 @@
 import { useEffect, useMemo, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import type {
-  AiConfigView,
+  AiModelView,
   Connection,
-  EmbeddingConfigView,
+  EmbeddingModelView,
   EmbeddingProvider,
   McpStatus,
 } from "../types";
@@ -89,42 +89,174 @@ function TabButton({
 }
 
 function ChatForm({ onClose }: { onClose: () => void }) {
-  const [config, setConfig] = useState<AiConfigView | null>(null);
-  const [baseUrl, setBaseUrl] = useState("");
-  const [model, setModel] = useState("");
-  const [apiKey, setApiKey] = useState("");
-  const [enableThinking, setEnableThinking] = useState(true);
-  const [saving, setSaving] = useState(false);
+  const [models, setModels] = useState<AiModelView[]>([]);
+  const [editing, setEditing] = useState<AiModelView | null | "new">(null);
   const [error, setError] = useState("");
-  const [saved, setSaved] = useState(false);
+  const [notice, setNotice] = useState("");
+
+  async function refresh() {
+    try {
+      const list = await invoke<AiModelView[]>("list_ai_models");
+      setModels(list);
+    } catch (e) {
+      setError(String(e));
+    }
+  }
 
   useEffect(() => {
-    invoke<AiConfigView>("get_ai_config")
-      .then((c) => {
-        setConfig(c);
-        setBaseUrl(c.base_url);
-        setModel(c.model);
-        // null (never set) → default ON, matching observed model behavior
-        setEnableThinking(c.enable_thinking ?? true);
-      })
-      .catch((e) => setError(String(e)));
+    void refresh();
   }, []);
+
+  async function activate(id: number) {
+    setError("");
+    setNotice("");
+    try {
+      await invoke("set_active_ai_model", { id });
+      setNotice("Active model switched.");
+      await refresh();
+    } catch (e) {
+      setError(String(e));
+    }
+  }
+
+  async function remove(m: AiModelView) {
+    if (
+      !window.confirm(
+        `Delete model "${m.name}"? Its API key will also be cleared.`,
+      )
+    )
+      return;
+    setError("");
+    setNotice("");
+    try {
+      await invoke("delete_ai_model", { id: m.id });
+      await refresh();
+    } catch (e) {
+      setError(String(e));
+    }
+  }
+
+  if (editing !== null) {
+    return (
+      <ChatEditForm
+        initial={editing === "new" ? null : editing}
+        onCancel={() => setEditing(null)}
+        onSaved={async () => {
+          setEditing(null);
+          await refresh();
+        }}
+      />
+    );
+  }
+
+  return (
+    <div className="p-4 flex flex-col gap-3">
+      <p className="text-[11.5px] text-muted leading-relaxed">
+        Configure one or more OpenAI-compatible models. The active model is used
+        for every AI-powered feature.
+      </p>
+
+      {models.length === 0 ? (
+        <div className="text-[12px] text-muted bg-bg-2 border border-border rounded px-3 py-4 text-center">
+          No models configured yet. Add one to enable AI features.
+        </div>
+      ) : (
+        <div className="flex flex-col gap-2">
+          {models.map((m) => (
+            <ModelCard
+              key={m.id}
+              title={m.name}
+              subtitle={
+                <>
+                  <span className="font-mono">{m.model}</span>
+                  <span className="text-subtle"> · </span>
+                  <span className="font-mono">{m.base_url}</span>
+                </>
+              }
+              isActive={m.is_active}
+              hasKey={m.has_api_key}
+              onActivate={() => void activate(m.id)}
+              onEdit={() => setEditing(m)}
+              onDelete={() => void remove(m)}
+            />
+          ))}
+        </div>
+      )}
+
+      <div className="flex items-center justify-between">
+        <button
+          type="button"
+          onClick={() => setEditing("new")}
+          className="h-7 px-3 text-[12px] font-medium text-ink-2 bg-panel border border-border rounded-md hover:bg-bg-2"
+        >
+          + Add model
+        </button>
+        <button
+          type="button"
+          onClick={onClose}
+          className="h-7 px-3 text-[12px] text-ink-2 bg-panel border border-border rounded-md hover:bg-bg-2"
+        >
+          Close
+        </button>
+      </div>
+
+      {error && (
+        <pre className="m-0 px-3 py-2 bg-crit-soft text-crit text-[12px] rounded whitespace-pre-wrap">
+          {error}
+        </pre>
+      )}
+      {notice && !error && (
+        <div className="px-3 py-2 bg-ok-soft text-ok text-[12px] rounded">
+          {notice}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function ChatEditForm({
+  initial,
+  onCancel,
+  onSaved,
+}: {
+  initial: AiModelView | null;
+  onCancel: () => void;
+  onSaved: () => Promise<void> | void;
+}) {
+  const [name, setName] = useState(initial?.name ?? "");
+  const [baseUrl, setBaseUrl] = useState(initial?.base_url ?? "");
+  const [model, setModel] = useState(initial?.model ?? "");
+  const [apiKey, setApiKey] = useState("");
+  // null (never set) → default ON, matching observed model behavior
+  const [enableThinking, setEnableThinking] = useState(
+    initial?.enable_thinking ?? true,
+  );
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState("");
 
   async function save() {
     setSaving(true);
     setError("");
-    setSaved(false);
     try {
-      await invoke("save_ai_config", {
-        baseUrl,
-        model,
-        apiKey,
-        enableThinking,
-      });
-      setSaved(true);
-      setApiKey("");
-      const updated = await invoke<AiConfigView>("get_ai_config");
-      setConfig(updated);
+      if (initial) {
+        await invoke("update_ai_model", {
+          id: initial.id,
+          name,
+          baseUrl,
+          model,
+          apiKey,
+          enableThinking,
+        });
+      } else {
+        await invoke("create_ai_model", {
+          name,
+          baseUrl,
+          model,
+          apiKey,
+          enableThinking,
+        });
+      }
+      await onSaved();
     } catch (e) {
       setError(String(e));
     } finally {
@@ -140,14 +272,28 @@ function ChatForm({ onClose }: { onClose: () => void }) {
       }}
       className="p-4 flex flex-col gap-3"
     >
-      <p className="text-[11.5px] text-muted leading-relaxed">
-        OpenAI-compatible API. Works with OpenAI, DeepSeek, Azure OpenAI, or any
-        service exposing{" "}
-        <code className="font-mono text-[11px] px-1 bg-bg-2 rounded text-ink-2">
-          /chat/completions
-        </code>
-        .
-      </p>
+      <div className="flex items-center justify-between">
+        <div className="text-[12px] font-semibold text-ink">
+          {initial ? `Edit "${initial.name}"` : "Add chat model"}
+        </div>
+        <button
+          type="button"
+          onClick={onCancel}
+          className="text-[11px] text-muted hover:text-ink"
+        >
+          ← Back
+        </button>
+      </div>
+
+      <Field label="Name" required>
+        <input
+          value={name}
+          onChange={(e) => setName(e.target.value)}
+          placeholder="OpenAI · DeepSeek · Company GPT …"
+          required
+          className="form-input"
+        />
+      </Field>
 
       <Field label="Base URL" required>
         <input
@@ -171,14 +317,14 @@ function ChatForm({ onClose }: { onClose: () => void }) {
 
       <Field
         label="API Key"
-        hint={config?.has_api_key ? "stored — leave blank to keep" : "sk-…"}
+        hint={initial?.has_api_key ? "stored — leave blank to keep" : "sk-…"}
       >
         <input
           type="password"
           value={apiKey}
           onChange={(e) => setApiKey(e.target.value)}
           placeholder={
-            config?.has_api_key ? "(leave blank to keep)" : "sk-..."
+            initial?.has_api_key ? "(leave blank to keep)" : "sk-..."
           }
           autoComplete="off"
           className="form-input"
@@ -207,49 +353,267 @@ function ChatForm({ onClose }: { onClose: () => void }) {
         </div>
       </label>
 
-      <FormFooter
-        error={error}
-        saved={saved}
-        saving={saving}
-        onClose={onClose}
-      />
+      {error && (
+        <pre className="m-0 px-3 py-2 bg-crit-soft text-crit text-[12px] rounded whitespace-pre-wrap">
+          {error}
+        </pre>
+      )}
+
+      <div className="flex items-center justify-end gap-2 pt-2 border-t border-border">
+        <button
+          type="button"
+          onClick={onCancel}
+          className="h-7 px-3 text-[12px] text-ink-2 bg-panel border border-border rounded-md hover:bg-bg-2"
+        >
+          Cancel
+        </button>
+        <button
+          type="submit"
+          disabled={saving}
+          className="h-7 px-3 text-[12px] font-semibold text-white bg-acc rounded-md hover:bg-acc-2 disabled:opacity-50 disabled:cursor-not-allowed"
+        >
+          {saving ? "Saving…" : "Save"}
+        </button>
+      </div>
     </form>
   );
 }
 
+/**
+ * Shared visual unit for "one model in the list". Chat tab and Embedding tab
+ * render different metadata in `subtitle`, but layout — active radio, name,
+ * meta, edit / delete actions — is identical, so co-locating prevents drift.
+ */
+function ModelCard({
+  title,
+  subtitle,
+  isActive,
+  hasKey,
+  onActivate,
+  onEdit,
+  onDelete,
+}: {
+  title: string;
+  subtitle: React.ReactNode;
+  isActive: boolean;
+  hasKey: boolean;
+  onActivate: () => void;
+  onEdit: () => void;
+  onDelete: () => void;
+}) {
+  return (
+    <div
+      className={`flex items-center gap-3 px-3 py-2 border rounded-md ${
+        isActive ? "border-acc bg-acc-soft" : "border-border bg-panel"
+      }`}
+    >
+      <label className="shrink-0 cursor-pointer select-none">
+        <input
+          type="radio"
+          checked={isActive}
+          onChange={onActivate}
+          className="w-3.5 h-3.5 accent-acc cursor-pointer"
+        />
+      </label>
+      <div className="flex-1 min-w-0">
+        <div className="flex items-center gap-2">
+          <span className="text-[12px] font-semibold text-ink truncate">
+            {title}
+          </span>
+          {isActive && (
+            <span className="text-[10px] uppercase tracking-wider text-acc font-bold">
+              Active
+            </span>
+          )}
+          {!hasKey && (
+            <span className="text-[10px] uppercase tracking-wider text-warn font-bold">
+              No key
+            </span>
+          )}
+        </div>
+        <div className="text-[11px] text-muted truncate">{subtitle}</div>
+      </div>
+      <div className="flex items-center gap-1 shrink-0">
+        <button
+          type="button"
+          onClick={onEdit}
+          className="h-6 px-2 text-[11px] text-ink-2 bg-panel border border-border rounded hover:bg-bg-2"
+        >
+          Edit
+        </button>
+        <button
+          type="button"
+          onClick={onDelete}
+          className="h-6 px-2 text-[11px] text-crit bg-panel border border-border rounded hover:bg-bg-2"
+        >
+          Delete
+        </button>
+      </div>
+    </div>
+  );
+}
+
 function EmbeddingForm({ onClose }: { onClose: () => void }) {
-  const [config, setConfig] = useState<EmbeddingConfigView | null>(null);
-  const [provider, setProvider] = useState<EmbeddingProvider>("openai");
-  const [baseUrl, setBaseUrl] = useState("");
-  const [model, setModel] = useState("");
-  const [deployment, setDeployment] = useState("");
-  const [apiVersion, setApiVersion] = useState("");
-  // Keep dimensions as a string in form state so the input can be cleared
-  // freely. Empty string → omit on save (model default).
-  const [dimensions, setDimensions] = useState("");
+  const [models, setModels] = useState<EmbeddingModelView[]>([]);
+  const [editing, setEditing] = useState<EmbeddingModelView | null | "new">(
+    null,
+  );
+  const [error, setError] = useState("");
+  const [notice, setNotice] = useState("");
+
+  async function refresh() {
+    try {
+      const list = await invoke<EmbeddingModelView[]>("list_embedding_models");
+      setModels(list);
+    } catch (e) {
+      setError(String(e));
+    }
+  }
+
+  useEffect(() => {
+    void refresh();
+  }, []);
+
+  async function activate(id: number) {
+    setError("");
+    setNotice("");
+    try {
+      await invoke("set_active_embedding_model", { id });
+      setNotice("Active model switched.");
+      await refresh();
+    } catch (e) {
+      setError(String(e));
+    }
+  }
+
+  async function remove(m: EmbeddingModelView) {
+    if (
+      !window.confirm(
+        `Delete embedding "${m.name}"? Its API key will also be cleared.`,
+      )
+    )
+      return;
+    setError("");
+    setNotice("");
+    try {
+      await invoke("delete_embedding_model", { id: m.id });
+      await refresh();
+    } catch (e) {
+      setError(String(e));
+    }
+  }
+
+  if (editing !== null) {
+    return (
+      <EmbeddingEditForm
+        initial={editing === "new" ? null : editing}
+        onCancel={() => setEditing(null)}
+        onSaved={async () => {
+          setEditing(null);
+          await refresh();
+        }}
+      />
+    );
+  }
+
+  return (
+    <div className="p-4 flex flex-col gap-3">
+      <p className="text-[11.5px] text-muted leading-relaxed">
+        Configure one or more embedding providers (OpenAI-compatible or Azure
+        OpenAI). The active model is used for schema vectorization and semantic
+        search.
+      </p>
+
+      {models.length === 0 ? (
+        <div className="text-[12px] text-muted bg-bg-2 border border-border rounded px-3 py-4 text-center">
+          No embedding models configured yet.
+        </div>
+      ) : (
+        <div className="flex flex-col gap-2">
+          {models.map((m) => (
+            <ModelCard
+              key={m.id}
+              title={m.name}
+              subtitle={
+                <>
+                  <span className="uppercase">{m.provider}</span>
+                  <span className="text-subtle"> · </span>
+                  <span className="font-mono">
+                    {m.provider === "azure" ? m.deployment : m.model}
+                  </span>
+                  <span className="text-subtle"> · </span>
+                  <span className="font-mono truncate">{m.base_url}</span>
+                </>
+              }
+              isActive={m.is_active}
+              hasKey={m.has_api_key}
+              onActivate={() => void activate(m.id)}
+              onEdit={() => setEditing(m)}
+              onDelete={() => void remove(m)}
+            />
+          ))}
+        </div>
+      )}
+
+      <div className="flex items-center justify-between">
+        <button
+          type="button"
+          onClick={() => setEditing("new")}
+          className="h-7 px-3 text-[12px] font-medium text-ink-2 bg-panel border border-border rounded-md hover:bg-bg-2"
+        >
+          + Add embedding
+        </button>
+        <button
+          type="button"
+          onClick={onClose}
+          className="h-7 px-3 text-[12px] text-ink-2 bg-panel border border-border rounded-md hover:bg-bg-2"
+        >
+          Close
+        </button>
+      </div>
+
+      {error && (
+        <pre className="m-0 px-3 py-2 bg-crit-soft text-crit text-[12px] rounded whitespace-pre-wrap">
+          {error}
+        </pre>
+      )}
+      {notice && !error && (
+        <div className="px-3 py-2 bg-ok-soft text-ok text-[12px] rounded">
+          {notice}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function EmbeddingEditForm({
+  initial,
+  onCancel,
+  onSaved,
+}: {
+  initial: EmbeddingModelView | null;
+  onCancel: () => void;
+  onSaved: () => Promise<void> | void;
+}) {
+  const [name, setName] = useState(initial?.name ?? "");
+  const [provider, setProvider] = useState<EmbeddingProvider>(
+    initial?.provider ?? "openai",
+  );
+  const [baseUrl, setBaseUrl] = useState(initial?.base_url ?? "");
+  const [model, setModel] = useState(initial?.model ?? "");
+  const [deployment, setDeployment] = useState(initial?.deployment ?? "");
+  const [apiVersion, setApiVersion] = useState(initial?.api_version ?? "");
+  // String state lets the user clear the field freely; empty → omit on save.
+  const [dimensions, setDimensions] = useState(
+    initial?.dimensions != null ? String(initial.dimensions) : "",
+  );
   const [apiKey, setApiKey] = useState("");
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState("");
-  const [saved, setSaved] = useState(false);
-
-  useEffect(() => {
-    invoke<EmbeddingConfigView>("get_embedding_config")
-      .then((c) => {
-        setConfig(c);
-        setProvider(c.provider);
-        setBaseUrl(c.base_url);
-        setModel(c.model);
-        setDeployment(c.deployment);
-        setApiVersion(c.api_version);
-        setDimensions(c.dimensions != null ? String(c.dimensions) : "");
-      })
-      .catch((e) => setError(String(e)));
-  }, []);
 
   async function save() {
     setSaving(true);
     setError("");
-    setSaved(false);
     try {
       let dims: number | null = null;
       const trimmed = dimensions.trim();
@@ -270,7 +634,8 @@ function EmbeddingForm({ onClose }: { onClose: () => void }) {
       } else if (!model.trim()) {
         throw new Error("Model is required.");
       }
-      await invoke("save_embedding_config", {
+      const payload = {
+        name,
         provider,
         baseUrl,
         model,
@@ -278,11 +643,13 @@ function EmbeddingForm({ onClose }: { onClose: () => void }) {
         apiVersion,
         dimensions: dims,
         apiKey,
-      });
-      setSaved(true);
-      setApiKey("");
-      const updated = await invoke<EmbeddingConfigView>("get_embedding_config");
-      setConfig(updated);
+      };
+      if (initial) {
+        await invoke("update_embedding_model", { id: initial.id, ...payload });
+      } else {
+        await invoke("create_embedding_model", payload);
+      }
+      await onSaved();
     } catch (e) {
       setError(String(e));
     } finally {
@@ -300,30 +667,28 @@ function EmbeddingForm({ onClose }: { onClose: () => void }) {
       }}
       className="p-4 flex flex-col gap-3"
     >
-      <p className="text-[11.5px] text-muted leading-relaxed">
-        {isAzure ? (
-          <>
-            Azure OpenAI Embeddings. Calls{" "}
-            <code className="font-mono text-[11px] px-1 bg-bg-2 rounded text-ink-2">
-              {`{endpoint}/openai/deployments/{deployment}/embeddings?api-version=…`}
-            </code>{" "}
-            with{" "}
-            <code className="font-mono text-[11px] px-1 bg-bg-2 rounded text-ink-2">
-              api-key
-            </code>{" "}
-            header.
-          </>
-        ) : (
-          <>
-            OpenAI-compatible API. Works with OpenAI, Voyage, Jina, vLLM, or any
-            service exposing{" "}
-            <code className="font-mono text-[11px] px-1 bg-bg-2 rounded text-ink-2">
-              /embeddings
-            </code>
-            .
-          </>
-        )}
-      </p>
+      <div className="flex items-center justify-between">
+        <div className="text-[12px] font-semibold text-ink">
+          {initial ? `Edit "${initial.name}"` : "Add embedding model"}
+        </div>
+        <button
+          type="button"
+          onClick={onCancel}
+          className="text-[11px] text-muted hover:text-ink"
+        >
+          ← Back
+        </button>
+      </div>
+
+      <Field label="Name" required>
+        <input
+          value={name}
+          onChange={(e) => setName(e.target.value)}
+          placeholder="OpenAI Embeddings · Voyage · Azure …"
+          required
+          className="form-input"
+        />
+      </Field>
 
       <Field label="Provider" required>
         <select
@@ -402,14 +767,20 @@ function EmbeddingForm({ onClose }: { onClose: () => void }) {
 
       <Field
         label="API Key"
-        hint={config?.has_api_key ? "stored — leave blank to keep" : isAzure ? "from Azure portal" : "sk-…"}
+        hint={
+          initial?.has_api_key
+            ? "stored — leave blank to keep"
+            : isAzure
+              ? "from Azure portal"
+              : "sk-…"
+        }
       >
         <input
           type="password"
           value={apiKey}
           onChange={(e) => setApiKey(e.target.value)}
           placeholder={
-            config?.has_api_key
+            initial?.has_api_key
               ? "(leave blank to keep)"
               : isAzure
                 ? "Azure key"
@@ -420,47 +791,19 @@ function EmbeddingForm({ onClose }: { onClose: () => void }) {
         />
       </Field>
 
-      <FormFooter
-        error={error}
-        saved={saved}
-        saving={saving}
-        onClose={onClose}
-      />
-    </form>
-  );
-}
-
-function FormFooter({
-  error,
-  saved,
-  saving,
-  onClose,
-}: {
-  error: string;
-  saved: boolean;
-  saving: boolean;
-  onClose: () => void;
-}) {
-  return (
-    <>
       {error && (
         <pre className="m-0 px-3 py-2 bg-crit-soft text-crit text-[12px] rounded whitespace-pre-wrap">
           {error}
         </pre>
       )}
-      {saved && !error && (
-        <div className="px-3 py-2 bg-ok-soft text-ok text-[12px] rounded">
-          Settings saved.
-        </div>
-      )}
 
       <div className="flex items-center justify-end gap-2 pt-2 border-t border-border">
         <button
           type="button"
-          onClick={onClose}
+          onClick={onCancel}
           className="h-7 px-3 text-[12px] text-ink-2 bg-panel border border-border rounded-md hover:bg-bg-2"
         >
-          Close
+          Cancel
         </button>
         <button
           type="submit"
@@ -470,7 +813,7 @@ function FormFooter({
           {saving ? "Saving…" : "Save"}
         </button>
       </div>
-    </>
+    </form>
   );
 }
 

@@ -72,25 +72,41 @@ export type MutationResult = {
 
 export type Injection = { sql: string; autorun: boolean; nonce: number };
 
-export type AiConfigView = {
-  base_url: string;
-  model: string;
-  has_api_key: boolean;
-  enable_thinking: boolean | null;
-};
-
 export type EmbeddingProvider = "openai" | "azure";
 
-export type EmbeddingConfigView = {
+export type AiModelView = {
+  id: number;
+  name: string;
+  base_url: string;
+  model: string;
+  enable_thinking: boolean | null;
+  has_api_key: boolean;
+  is_active: boolean;
+};
+
+export type EmbeddingModelView = {
+  id: number;
+  name: string;
   provider: EmbeddingProvider;
   base_url: string;
   model: string;
-  /** Azure-only — deployment name. Empty string for OpenAI. */
   deployment: string;
-  /** Azure-only — api-version query string. Empty string for OpenAI. */
   api_version: string;
   dimensions: number | null;
   has_api_key: boolean;
+  is_active: boolean;
+};
+
+export type ActiveAiSummary = {
+  id: number | null;
+  name: string | null;
+  model: string | null;
+};
+
+export type ActiveEmbeddingSummary = {
+  id: number | null;
+  name: string | null;
+  model: string | null;
 };
 
 export type McpStatus = {
