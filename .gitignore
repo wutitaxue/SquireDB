@@ -37,3 +37,6 @@ dist-ssr
 
 # OS
 Thumbs.db
+
+# Claude Code local config / auto-memory
+.claude/

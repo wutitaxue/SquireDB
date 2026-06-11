@@ -23,6 +23,10 @@ type Props = {
   onTablePreview: (t: ProjectTable) => void;
   /** Double click on a table — open drill workspace with this table as root. */
   onTableDrill: (t: ProjectTable) => void;
+  onTableContextMenu?: (
+    e: { clientX: number; clientY: number; preventDefault: () => void },
+    t: ProjectTable,
+  ) => void;
 };
 
 function tableKey(connId: number, db: string, table: string): string {
@@ -49,6 +53,7 @@ export function ProjectTreeView({
   filters,
   onTablePreview,
   onTableDrill,
+  onTableContextMenu,
 }: Props) {
   const connLabel = useMemo(() => {
     const m = new Map<number, string>();
@@ -204,6 +209,14 @@ export function ProjectTreeView({
                             className={`group flex items-center pl-2 pr-1 rounded ${
                               isActive ? "bg-acc-soft" : "hover:bg-bg"
                             }`}
+                            onContextMenu={
+                              onTableContextMenu
+                                ? (e) => {
+                                    e.stopPropagation();
+                                    onTableContextMenu(e, t);
+                                  }
+                                : undefined
+                            }
                           >
                             <button
                               onClick={() => void toggleTable(t)}

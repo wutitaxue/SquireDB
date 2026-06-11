@@ -1185,3 +1185,117 @@ fn strip_sql_fence(s: &str) -> String {
     }
     trimmed.to_string()
 }
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct TableEditProposal {
+    pub modified: crate::ddl::TableStructure,
+    pub summary: String,
+}
+
+pub async fn ai_table_edit(
+    config: &AiConfig,
+    api_key: &str,
+    current: &crate::ddl::TableStructure,
+    instruction: &str,
+) -> Result<TableEditProposal, String> {
+    let system_prompt = "You are a MySQL schema designer. Given an existing table structure (JSON) and a natural-language change request, \
+return the modified table structure plus a 1-sentence summary.\n\
+\n\
+Rules:\n\
+- Output strictly valid JSON, no markdown fences, no text outside JSON.\n\
+- JSON shape: {\"summary\": \"...\", \"modified\": <TableStructure>}\n\
+- TableStructure fields (must match exactly): database, table, engine, charset, collation, comment (string or null), columns[], indexes[], foreign_keys[].\n\
+- columns[] item fields: name, data_type, nullable (bool), default_value (string or null), default_is_expression (bool), auto_increment (bool), on_update (string or null), comment (string or null), charset (string or null), collation (string or null).\n\
+- data_type must be a full MySQL column type including size, e.g. \"varchar(255)\", \"int unsigned\", \"decimal(10,2)\", \"datetime\". Do NOT use generic SQL types.\n\
+- default_is_expression = true when default_value is an SQL expression (CURRENT_TIMESTAMP, NULL, function call). false when it's a literal.\n\
+- indexes[] item fields: name, kind (one of \"primary\"|\"unique\"|\"index\"|\"fulltext\"|\"spatial\"), columns[{name,length(uint or null),desc(bool)}], comment (string or null).\n\
+- foreign_keys[] item fields: name, columns[], ref_database (string or null), ref_table, ref_columns[], on_delete / on_update (one of \"no_action\"|\"restrict\"|\"cascade\"|\"set_null\"|\"set_default\").\n\
+- Preserve any column/index/fk the user did not ask to change. Do NOT renumber or reorder unless asked.\n\
+- If the request is ambiguous, choose the safer interpretation (do not drop data, do not widen permissions).\n\
+- summary: ≤ 1 sentence describing what changed.\n\
+- Match the language of the instruction (CJK → 中文 summary, English → English).";
+
+    let current_json = serde_json::to_string(current)
+        .map_err(|e| format!("serialize current structure failed: {e}"))?;
+    let user_prompt = format!(
+        "Current table structure:\n{current_json}\n\nChange request:\n{instruction}\n\nProduce the JSON now."
+    );
+
+    let messages = vec![
+        ChatMessage {
+            role: "system".into(),
+            content: system_prompt.into(),
+        },
+        ChatMessage {
+            role: "user".into(),
+            content: user_prompt,
+        },
+    ];
+
+    let content = call_chat(config, api_key, messages, 0.2, 90, "ai_table_edit").await?;
+    let cleaned = strip_json_fence(&content);
+    serde_json::from_str::<TableEditProposal>(&cleaned)
+        .map_err(|e| format!("parse table edit JSON failed: {e}; raw: {content}"))
+}
+
+#[derive(Debug, Serialize)]
+pub struct TableCreateProposal {
+    pub structure: crate::ddl::TableStructure,
+    pub summary: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct TableCreateRaw {
+    summary: String,
+    structure: crate::ddl::TableStructure,
+}
+
+pub async fn ai_create_table(
+    config: &AiConfig,
+    api_key: &str,
+    database: &str,
+    instruction: &str,
+) -> Result<TableCreateProposal, String> {
+    let system_prompt = "You are a MySQL schema designer. Given a natural-language description, \
+design a new MySQL table.\n\
+\n\
+Rules:\n\
+- Output strictly valid JSON, no markdown fences, no text outside JSON.\n\
+- JSON shape: {\"summary\": \"...\", \"structure\": <TableStructure>}\n\
+- TableStructure fields (must match exactly): database, table, engine, charset, collation, comment (string or null), columns[], indexes[], foreign_keys[].\n\
+- Default to engine=\"InnoDB\", charset=\"utf8mb4\", collation=\"utf8mb4_0900_ai_ci\".\n\
+- columns[] item fields: name, data_type, nullable (bool), default_value (string or null), default_is_expression (bool), auto_increment (bool), on_update (string or null), comment (string or null), charset (string or null), collation (string or null).\n\
+- Always include an `id` BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY unless the user explicitly defines another primary key.\n\
+- Always include created_at / updated_at DATETIME DEFAULT CURRENT_TIMESTAMP and ON UPDATE CURRENT_TIMESTAMP for updated_at, unless the user explicitly says otherwise.\n\
+- data_type must be a full MySQL column type including size.\n\
+- indexes[] item fields: name, kind (one of \"primary\"|\"unique\"|\"index\"|\"fulltext\"|\"spatial\"), columns[{name,length(uint or null),desc(bool)}], comment (string or null).\n\
+- foreign_keys[] item fields: name, columns[], ref_database (null), ref_table, ref_columns[], on_delete / on_update (one of \"no_action\"|\"restrict\"|\"cascade\"|\"set_null\"|\"set_default\").\n\
+- Set database to the value provided by the user; leave foreign_keys[] empty unless the user explicitly references another table.\n\
+- table name: snake_case, plural noun by convention.\n\
+- summary: ≤ 1 sentence describing the table purpose.\n\
+- Match the language of the instruction.";
+
+    let user_prompt = format!(
+        "Database: {database}\nDescription:\n{instruction}\n\nProduce the JSON now."
+    );
+
+    let messages = vec![
+        ChatMessage {
+            role: "system".into(),
+            content: system_prompt.into(),
+        },
+        ChatMessage {
+            role: "user".into(),
+            content: user_prompt,
+        },
+    ];
+
+    let content = call_chat(config, api_key, messages, 0.3, 90, "ai_create_table").await?;
+    let cleaned = strip_json_fence(&content);
+    let raw: TableCreateRaw = serde_json::from_str(&cleaned)
+        .map_err(|e| format!("parse create table JSON failed: {e}; raw: {content}"))?;
+    Ok(TableCreateProposal {
+        structure: raw.structure,
+        summary: raw.summary,
+    })
+}

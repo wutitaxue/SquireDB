@@ -35,6 +35,8 @@ import { RepairWorkspace } from "./workspaces/RepairWorkspace";
 import { ErDiagramWorkspace } from "./workspaces/ErDiagramWorkspace";
 import { DeadlockWorkspace } from "./workspaces/DeadlockWorkspace";
 import { MilvusSearchWorkspace } from "./workspaces/MilvusSearchWorkspace";
+import { TableDesignerWorkspace } from "./workspaces/TableDesignerWorkspace";
+import { DropTableModal } from "./panels/designer/DropTableModal";
 import { RedisExplorerShell } from "./workspaces/RedisExplorerShell";
 import { Titlebar } from "./shell/Titlebar";
 import { Tabbar } from "./shell/Tabbar";
@@ -61,11 +63,13 @@ import {
   milvusSearchTabId,
   redisKeyTabId,
   redisConsoleTabId,
+  tableDesignerTabId,
   type AgentId,
   type AppMode,
   type ProjectAgentId,
   type Tab,
 } from "./shell/types";
+import { useContextMenu, type ContextMenuItem } from "./shell/atoms/ContextMenu";
 import { connectionKindMeta, formatTime } from "./utils";
 
 /**
@@ -129,7 +133,25 @@ function App() {
   const [tabsByMode, setTabsByMode] = useState<
     Record<string, { tabs: Tab[]; activeTabId: string | null }>
   >({});
-  const [dockOpen, setDockOpen] = useState(true);
+  // Track user intent (what they explicitly want) vs the effective dockOpen.
+  // Below DOCK_NARROW_PX the dock is force-closed; above, restore user intent.
+  const DOCK_NARROW_PX = 1100;
+  const [userWantsDock, setUserWantsDock] = useState(true);
+  const [viewportNarrow, setViewportNarrow] = useState(
+    typeof window !== "undefined" && window.innerWidth < DOCK_NARROW_PX,
+  );
+  useEffect(() => {
+    const onResize = () =>
+      setViewportNarrow(window.innerWidth < DOCK_NARROW_PX);
+    window.addEventListener("resize", onResize);
+    return () => window.removeEventListener("resize", onResize);
+  }, []);
+  const dockOpen = userWantsDock && !viewportNarrow;
+  const setDockOpen = (v: boolean | ((prev: boolean) => boolean)) => {
+    setUserWantsDock((prev) =>
+      typeof v === "function" ? (v as (p: boolean) => boolean)(prev) : v,
+    );
+  };
 
   const workingId = mode.kind === "connection" ? mode.connectionId : null;
   const activeProjectId = mode.kind === "project" ? mode.projectId : null;
@@ -607,6 +629,148 @@ function App() {
     setSelectedKey(`${db}.${table}.${column}`);
   }
 
+  async function openTableDesigner(
+    connectionId: number,
+    db: string,
+    table: string | null,
+  ) {
+    try {
+      await invoke("open_connection", { id: connectionId });
+    } catch (e) {
+      setResult(String(e));
+      setIsError(true);
+      return;
+    }
+    const tabId = tableDesignerTabId(connectionId, db, table);
+    const name = table ? `Design: ${table}` : `New table · ${db}`;
+    const newTab: Tab = {
+      id: tabId,
+      kind: "table-designer",
+      name,
+      connectionId,
+      database: db,
+      table,
+    };
+    setTabsByMode((m) => {
+      const entry = m[wsKey] ?? { tabs: [], activeTabId: null };
+      const exists = entry.tabs.some((t) => t.id === tabId);
+      const tabs = exists ? entry.tabs : [...entry.tabs, newTab];
+      return { ...m, [wsKey]: { tabs, activeTabId: tabId } };
+    });
+  }
+
+  /** State for the type-table-name DROP confirmation modal. */
+  const [dropTarget, setDropTarget] = useState<
+    { connectionId: number; db: string; table: string } | null
+  >(null);
+
+  async function copyToClipboard(text: string) {
+    try {
+      await navigator.clipboard.writeText(text);
+    } catch {
+      // Clipboard API can fail in webview without user-gesture chain. Best effort.
+    }
+  }
+
+  async function copyCreateTable(connectionId: number, db: string, table: string) {
+    try {
+      const structure = await invoke<{ table: string; database: string }>(
+        "get_table_structure",
+        { connectionId, database: db, table },
+      );
+      const sql = await invoke<string>("generate_create_sql", { spec: structure });
+      await copyToClipboard(sql);
+    } catch (e) {
+      setResult(`Copy CREATE TABLE failed: ${e}`);
+      setIsError(true);
+    }
+  }
+
+  const tableMenu = useContextMenu();
+
+  function tableMenuItems(
+    connectionId: number,
+    db: string,
+    table: string,
+  ): ContextMenuItem[] {
+    return [
+      {
+        kind: "action",
+        icon: "✎",
+        label: "Design table…",
+        onClick: () => void openTableDesigner(connectionId, db, table),
+      },
+      {
+        kind: "action",
+        icon: "+",
+        label: "New table in this database…",
+        onClick: () => void openTableDesigner(connectionId, db, null),
+      },
+      {
+        kind: "action",
+        icon: "🗑",
+        label: "Drop table…",
+        danger: true,
+        onClick: () => setDropTarget({ connectionId, db, table }),
+      },
+      { kind: "separator" },
+      {
+        kind: "action",
+        icon: "⎘",
+        label: "Copy table name",
+        onClick: () => void copyToClipboard(table),
+      },
+      {
+        kind: "action",
+        icon: "⎘",
+        label: "Copy CREATE TABLE",
+        onClick: () => void copyCreateTable(connectionId, db, table),
+      },
+    ];
+  }
+
+  function dbMenuItems(connectionId: number, db: string): ContextMenuItem[] {
+    return [
+      {
+        kind: "action",
+        icon: "+",
+        label: "New table here…",
+        onClick: () => void openTableDesigner(connectionId, db, null),
+      },
+      { kind: "separator" },
+      {
+        kind: "action",
+        icon: "⎘",
+        label: "Copy database name",
+        onClick: () => void copyToClipboard(db),
+      },
+    ];
+  }
+
+  function projectTableMenuItems(t: ProjectTable): ContextMenuItem[] {
+    return [
+      {
+        kind: "action",
+        icon: "✎",
+        label: "Design table…",
+        onClick: () => void openTableDesigner(t.connection_id, t.database_name, t.table_name),
+      },
+      { kind: "separator" },
+      {
+        kind: "action",
+        icon: "⎘",
+        label: "Copy table name",
+        onClick: () => void copyToClipboard(t.table_name),
+      },
+      {
+        kind: "action",
+        icon: "⎘",
+        label: "Copy CREATE TABLE",
+        onClick: () => void copyCreateTable(t.connection_id, t.database_name, t.table_name),
+      },
+    ];
+  }
+
   function pickTargetQueryTab(): string | null {
     if (activeTabId) {
       const t = tabs.find((x) => x.id === activeTabId);
@@ -990,6 +1154,34 @@ function App() {
   function renderActiveNonQuery() {
     if (!activeTab) return null;
     if (!working) return null;
+    if (activeTab.kind === "table-designer") {
+      return (
+        <TableDesignerWorkspace
+          connectionId={activeTab.connectionId}
+          database={activeTab.database}
+          table={activeTab.table}
+          onApplied={(_, finalStructure) => {
+            // After successful DDL exec: refresh tables, close tab.
+            const db = finalStructure.database;
+            void (async () => {
+              try {
+                const list = await invoke<TableMetaForTree[]>(
+                  "list_table_meta",
+                  {
+                    connectionId: activeTab.connectionId,
+                    database: db,
+                  },
+                );
+                setTablesByDb((prev) => ({ ...prev, [db]: list }));
+              } catch {
+                // best effort
+              }
+            })();
+            closeTab(activeTab.id);
+          }}
+        />
+      );
+    }
     if (activeTab.kind === "agent") {
       switch (activeTab.agent) {
         case "health":
@@ -1211,6 +1403,22 @@ function App() {
                   }
                   onClickColumn={clickColumn}
                   onRequestSuggestions={(db, t) => void requestSuggestions(db, t)}
+                  onTableContextMenu={
+                    working.kind === "mysql" && workingId !== null
+                      ? (e, db, table) => {
+                          e.preventDefault();
+                          tableMenu.open(e, tableMenuItems(workingId, db, table));
+                        }
+                      : undefined
+                  }
+                  onDbContextMenu={
+                    working.kind === "mysql" && workingId !== null
+                      ? (e, db) => {
+                          e.preventDefault();
+                          tableMenu.open(e, dbMenuItems(workingId, db));
+                        }
+                      : undefined
+                  }
                 />
               }
               secondary={
@@ -1322,6 +1530,10 @@ function App() {
             dockOpen={dockOpen}
             onTablePreview={(t) => void openProjectPreview(t)}
             onTableDrill={(t) => openProjectDrill(t)}
+            onTableContextMenu={(e, t) => {
+              e.preventDefault();
+              tableMenu.open(e, projectTableMenuItems(t));
+            }}
             pendingDrillTable={pendingDrillTable}
             onAckPendingDrill={() => setPendingDrillTable(null)}
             queryInjections={queryInjections}
@@ -1423,6 +1635,56 @@ function App() {
           }
         />
       )}
+      {dropTarget && (
+        <DropTableModal
+          connectionId={dropTarget.connectionId}
+          database={dropTarget.db}
+          table={dropTarget.table}
+          onClose={() => setDropTarget(null)}
+          onDropped={() => {
+            const dropped = dropTarget;
+            setDropTarget(null);
+            // Close any TableDesigner tab targeting this table.
+            const tabId = tableDesignerTabId(
+              dropped.connectionId,
+              dropped.db,
+              dropped.table,
+            );
+            setTabsByMode((m) => {
+              const next: typeof m = {};
+              for (const [k, v] of Object.entries(m)) {
+                const filtered = v.tabs.filter((t) => t.id !== tabId);
+                next[k] = {
+                  tabs: filtered,
+                  activeTabId:
+                    v.activeTabId === tabId
+                      ? filtered[filtered.length - 1]?.id ?? null
+                      : v.activeTabId,
+                };
+              }
+              return next;
+            });
+            // Refresh schema tree if dropped from current working connection.
+            if (workingId === dropped.connectionId) {
+              void (async () => {
+                try {
+                  const list = await invoke<TableMetaForTree[]>(
+                    "list_table_meta",
+                    {
+                      connectionId: dropped.connectionId,
+                      database: dropped.db,
+                    },
+                  );
+                  setTablesByDb((prev) => ({ ...prev, [dropped.db]: list }));
+                } catch {
+                  // Best effort — user can manually collapse/expand to retry.
+                }
+              })();
+            }
+          }}
+        />
+      )}
+      {tableMenu.element}
     </div>
   );
 }
@@ -1698,7 +1960,7 @@ function EditFormModal({
       onClick={onCancel}
     >
       <div
-        className="bg-panel border border-border rounded-lg w-[520px] max-h-[90vh] overflow-auto"
+        className="bg-panel border border-border rounded-lg w-[520px] max-w-[92vw] max-h-[90vh] overflow-auto"
         style={{ boxShadow: "var(--sh-3)" }}
         onClick={(e) => e.stopPropagation()}
       >

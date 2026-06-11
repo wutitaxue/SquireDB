@@ -1212,3 +1212,99 @@ export type DeadlockResponse = {
   ai_analysis: DeadlockAnalysis | null;
   ai_error: string | null;
 };
+
+// =====================================================================
+// DDL / Table designer
+// =====================================================================
+
+export type IndexKind = "primary" | "unique" | "index" | "fulltext" | "spatial";
+
+export type FkAction =
+  | "no_action"
+  | "restrict"
+  | "cascade"
+  | "set_null"
+  | "set_default";
+
+export type ColumnSpec = {
+  name: string;
+  data_type: string;
+  nullable: boolean;
+  default_value: string | null;
+  default_is_expression: boolean;
+  auto_increment: boolean;
+  on_update: string | null;
+  comment: string | null;
+  charset: string | null;
+  collation: string | null;
+};
+
+export type IndexColumn = {
+  name: string;
+  length: number | null;
+  desc: boolean;
+};
+
+export type IndexSpec = {
+  name: string;
+  kind: IndexKind;
+  columns: IndexColumn[];
+  comment: string | null;
+};
+
+export type ForeignKeySpec = {
+  name: string;
+  columns: string[];
+  ref_database: string | null;
+  ref_table: string;
+  ref_columns: string[];
+  on_delete: FkAction;
+  on_update: FkAction;
+};
+
+export type TableStructure = {
+  database: string;
+  table: string;
+  engine: string;
+  charset: string;
+  collation: string;
+  comment: string | null;
+  columns: ColumnSpec[];
+  indexes: IndexSpec[];
+  foreign_keys: ForeignKeySpec[];
+};
+
+export type TableEdit = {
+  original: TableStructure;
+  modified: TableStructure;
+  rename_to: string | null;
+};
+
+export type RiskLevel = "info" | "warn" | "critical";
+
+export type Risk = {
+  level: RiskLevel;
+  kind: string;
+  message: string;
+};
+
+export type AlterPlan = {
+  statements: string[];
+  sql: string;
+  risks: Risk[];
+};
+
+export type DdlExecResult = {
+  statements_executed: number;
+  elapsed_ms: number;
+};
+
+export type TableEditProposal = {
+  modified: TableStructure;
+  summary: string;
+};
+
+export type TableCreateProposal = {
+  structure: TableStructure;
+  summary: string;
+};

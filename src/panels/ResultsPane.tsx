@@ -15,8 +15,10 @@ import type {
 import { isImeComposing, parseLookupValue, renderCell } from "../utils";
 import {
   EXPORT_FORMAT_META,
+  backtick,
   defaultFilename,
   formatResult,
+  sqlLiteral,
   type ExportFormat,
 } from "../exportResult";
 import { ChartPanel } from "./ChartPanel";
@@ -130,7 +132,16 @@ function ResultsPaneImpl(props: Props) {
   const [exportOpen, setExportOpen] = useState(false);
   const [exportBusy, setExportBusy] = useState<ExportFormat | null>(null);
   const [exportError, setExportError] = useState("");
+  const [copyFlash, setCopyFlash] = useState<"insert" | "update" | null>(null);
+  const [copyOpen, setCopyOpen] = useState(false);
   const exportMenuRef = useRef<HTMLDivElement>(null);
+  const copyMenuRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    if (!copyFlash) return;
+    const t = window.setTimeout(() => setCopyFlash(null), 2000);
+    return () => window.clearTimeout(t);
+  }, [copyFlash]);
 
   // Close the export menu on outside click / Escape.
   useEffect(() => {
@@ -149,6 +160,23 @@ function ResultsPaneImpl(props: Props) {
       document.removeEventListener("keydown", onKey);
     };
   }, [exportOpen]);
+
+  useEffect(() => {
+    if (!copyOpen) return;
+    function onDocPointer(e: PointerEvent) {
+      if (!copyMenuRef.current) return;
+      if (!copyMenuRef.current.contains(e.target as Node)) setCopyOpen(false);
+    }
+    function onKey(e: KeyboardEvent) {
+      if (e.key === "Escape") setCopyOpen(false);
+    }
+    document.addEventListener("pointerdown", onDocPointer);
+    document.addEventListener("keydown", onKey);
+    return () => {
+      document.removeEventListener("pointerdown", onDocPointer);
+      document.removeEventListener("keydown", onKey);
+    };
+  }, [copyOpen]);
 
   async function runExport(fmt: ExportFormat) {
     setExportOpen(false);
@@ -340,6 +368,67 @@ function ResultsPaneImpl(props: Props) {
     }
   }
 
+  function selectedRowsInOrder(): unknown[][] {
+    if (!editable || selected.size === 0) return [];
+    return result.rows.filter((r) => selected.has(pkSignature(r, pkIndices)));
+  }
+
+  async function handleCopyInsert() {
+    if (!editable) return;
+    const rows = selectedRowsInOrder();
+    if (rows.length === 0) return;
+    const tableRef = `${backtick(editable.schema)}.${backtick(editable.table)}`;
+    const cols = result.columns.map((c) => backtick(c.name)).join(", ");
+    const lines = rows.map((row) => {
+      const vals = row.map((cell) => sqlLiteral(cell)).join(", ");
+      return `INSERT INTO ${tableRef} (${cols}) VALUES (${vals});`;
+    });
+    try {
+      await navigator.clipboard.writeText(lines.join("\n") + "\n");
+      setMutationError("");
+      setMutationStatus(`✓ Copied ${rows.length} INSERT statement${rows.length > 1 ? "s" : ""} to clipboard`);
+      setCopyFlash("insert");
+    } catch (e) {
+      setMutationError(`Copy failed: ${e}`);
+    }
+  }
+
+  async function handleCopyUpdate() {
+    if (!editable) return;
+    const rows = selectedRowsInOrder();
+    if (rows.length === 0) return;
+    if (pkIndices.length === 0 || pkIndices.some((i) => i < 0)) {
+      setMutationError("Cannot build UPDATE: primary key columns missing from result set.");
+      return;
+    }
+    const tableRef = `${backtick(editable.schema)}.${backtick(editable.table)}`;
+    const pkSet = new Set(pkIndices);
+    const setCols = result.columns
+      .map((c, i) => ({ c, i }))
+      .filter(({ i }) => !pkSet.has(i));
+    if (setCols.length === 0) {
+      setMutationError("Cannot build UPDATE: every column is part of the primary key.");
+      return;
+    }
+    const lines = rows.map((row) => {
+      const setClause = setCols
+        .map(({ c, i }) => `${backtick(c.name)} = ${sqlLiteral(row[i])}`)
+        .join(", ");
+      const whereClause = pkIndices
+        .map((i) => `${backtick(result.columns[i].name)} = ${sqlLiteral(row[i])}`)
+        .join(" AND ");
+      return `UPDATE ${tableRef} SET ${setClause} WHERE ${whereClause};`;
+    });
+    try {
+      await navigator.clipboard.writeText(lines.join("\n") + "\n");
+      setMutationError("");
+      setMutationStatus(`✓ Copied ${rows.length} UPDATE statement${rows.length > 1 ? "s" : ""} to clipboard`);
+      setCopyFlash("update");
+    } catch (e) {
+      setMutationError(`Copy failed: ${e}`);
+    }
+  }
+
   function toggleRowSelection(sig: string) {
     setSelected((prev) => {
       const next = new Set(prev);
@@ -432,7 +521,7 @@ function ResultsPaneImpl(props: Props) {
                 <button
                   onClick={discardEdits}
                   disabled={savingEdits}
-                  className="h-6 px-2 text-[11px] font-medium text-ink-2 bg-bg border border-border rounded-md hover:bg-bg-2 disabled:opacity-50"
+                  className="h-6 px-2 text-[11px] font-medium text-ink-2 bg-bg border border-border rounded-md hover:bg-bg-2 disabled:opacity-50 whitespace-nowrap shrink-0"
                   title="Discard all pending edits"
                 >
                   Discard
@@ -440,7 +529,7 @@ function ResultsPaneImpl(props: Props) {
                 <button
                   onClick={() => void saveEdits()}
                   disabled={savingEdits}
-                  className="h-6 px-2.5 text-[11px] font-semibold text-white bg-acc rounded-md hover:bg-acc-2 disabled:opacity-50 disabled:cursor-not-allowed"
+                  className="h-6 px-2.5 text-[11px] font-semibold text-white bg-acc rounded-md hover:bg-acc-2 disabled:opacity-50 disabled:cursor-not-allowed whitespace-nowrap shrink-0"
                   title="Commit all pending edits to the database"
                 >
                   {savingEdits
@@ -450,16 +539,55 @@ function ResultsPaneImpl(props: Props) {
               </>
             )}
             {selected.size > 0 && (
-              <button
-                onClick={() => void handleDelete()}
-                className="h-6 px-2.5 text-[11px] font-semibold text-white bg-crit rounded-md hover:opacity-90"
-              >
-                Delete {selected.size} row{selected.size > 1 ? "s" : ""}
-              </button>
+              <>
+                <div className="relative shrink-0" ref={copyMenuRef}>
+                  <button
+                    onClick={() => setCopyOpen((v) => !v)}
+                    title="Copy selected rows as SQL"
+                    className={`h-6 px-2 text-[11px] font-medium rounded-md border inline-flex items-center gap-1 whitespace-nowrap transition-colors ${
+                      copyFlash
+                        ? "bg-ok text-white border-ok"
+                        : "text-ink-2 bg-bg border-border hover:bg-bg-2"
+                    }`}
+                  >
+                    {copyFlash ? `✓ Copied ${copyFlash === "insert" ? "INSERT" : "UPDATE"}` : "Copy"}
+                    {!copyFlash && <span className="text-muted text-[9px]">▾</span>}
+                  </button>
+                  {copyOpen && (
+                    <div className="absolute right-0 top-7 z-20 min-w-[180px] bg-panel border border-border rounded-md shadow-lg py-1">
+                      <button
+                        onClick={() => {
+                          setCopyOpen(false);
+                          void handleCopyInsert();
+                        }}
+                        className="w-full text-left px-3 py-1.5 text-[11px] hover:bg-bg-2 whitespace-nowrap"
+                      >
+                        Copy as INSERT
+                      </button>
+                      <button
+                        onClick={() => {
+                          setCopyOpen(false);
+                          void handleCopyUpdate();
+                        }}
+                        className="w-full text-left px-3 py-1.5 text-[11px] hover:bg-bg-2 whitespace-nowrap"
+                        title="SET excludes primary key; WHERE uses primary key"
+                      >
+                        Copy as UPDATE
+                      </button>
+                    </div>
+                  )}
+                </div>
+                <button
+                  onClick={() => void handleDelete()}
+                  className="h-6 px-2.5 text-[11px] font-semibold text-white bg-crit rounded-md hover:opacity-90 whitespace-nowrap shrink-0"
+                >
+                  Delete {selected.size} row{selected.size > 1 ? "s" : ""}
+                </button>
+              </>
             )}
             <button
               onClick={() => setInsertOpen(true)}
-              className="h-6 px-2.5 text-[11px] font-semibold text-white bg-acc rounded-md hover:bg-acc-2"
+              className="h-6 px-2.5 text-[11px] font-semibold text-white bg-acc rounded-md hover:bg-acc-2 whitespace-nowrap shrink-0"
             >
               + Insert row
             </button>
@@ -1050,7 +1178,7 @@ function InsertRowDialog({
         if (e.target === e.currentTarget) onClose();
       }}
     >
-      <div className="bg-panel border border-border rounded-lg shadow-3 w-[560px] max-h-[80vh] flex flex-col">
+      <div className="bg-panel border border-border rounded-lg shadow-3 w-[560px] max-w-[92vw] max-h-[80vh] flex flex-col">
         <div className="px-4 py-3 border-b border-border flex items-center">
           <div className="font-semibold text-ink text-[13px]">
             Insert row into{" "}

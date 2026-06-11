@@ -276,7 +276,7 @@ function TableRow({ t }: { t: DictTable }) {
             </div>
           ) : (
             <div className="overflow-x-auto">
-              <table className="w-full text-[11.5px] font-mono">
+              <table className="w-full text-[11.5px] font-mono min-w-[780px]">
                 <thead>
                   <tr className="text-left text-muted">
                     <th className="py-1 pr-3 font-normal">Column</th>

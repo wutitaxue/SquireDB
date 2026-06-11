@@ -29,6 +29,15 @@ type Props = {
   onDoubleClickTable?: (db: string, table: string) => void;
   onClickColumn: (db: string, table: string, column: string) => void;
   onRequestSuggestions: (db: string, table: string) => void;
+  onTableContextMenu?: (
+    e: { clientX: number; clientY: number; preventDefault: () => void },
+    db: string,
+    table: string,
+  ) => void;
+  onDbContextMenu?: (
+    e: { clientX: number; clientY: number; preventDefault: () => void },
+    db: string,
+  ) => void;
 };
 
 function tableKey(db: string, table: string): string {
@@ -75,6 +84,8 @@ export function SchemaTreeView({
   onDoubleClickTable,
   onClickColumn,
   onRequestSuggestions,
+  onTableContextMenu,
+  onDbContextMenu,
 }: Props) {
   const q = query.trim().toLowerCase();
   const filterActive = q.length > 0 || filters.size > 0;
@@ -150,11 +161,21 @@ export function SchemaTreeView({
         if (filterActive && matchedTables && matchedTables.length === 0) return null;
         return (
           <li key={db}>
-            <TreeGroupRow
-              expanded={expanded}
-              onClick={() => onToggleDb(db)}
-              label={db}
-              muted={isSystem}
+            <div
+              onContextMenu={
+                onDbContextMenu
+                  ? (e) => {
+                      e.stopPropagation();
+                      onDbContextMenu(e, db);
+                    }
+                  : undefined
+              }
+            >
+              <TreeGroupRow
+                expanded={expanded}
+                onClick={() => onToggleDb(db)}
+                label={db}
+                muted={isSystem}
               trailing={
                 tables ? (
                   <span className="text-[10px] text-subtle font-mono shrink-0">
@@ -163,6 +184,7 @@ export function SchemaTreeView({
                 ) : undefined
               }
             />
+            </div>
             {expanded && tables && (
               <ul className="ml-[12px]">
                 {(matchedTables ?? tables).length === 0 && (
@@ -187,6 +209,14 @@ export function SchemaTreeView({
                         className={`group flex items-center pl-2 pr-1 rounded ${
                           selected ? "bg-acc-soft" : "hover:bg-bg"
                         }`}
+                        onContextMenu={
+                          onTableContextMenu
+                            ? (e) => {
+                                e.stopPropagation();
+                                onTableContextMenu(e, db, t.name);
+                              }
+                            : undefined
+                        }
                       >
                         <button
                           onClick={() => onToggleTable(db, t.name)}

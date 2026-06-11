@@ -55,6 +55,16 @@ export type RedisConsoleTab = {
   db: number;
 };
 
+export type TableDesignerTab = {
+  id: string;
+  kind: "table-designer";
+  name: string;
+  connectionId: number;
+  database: string;
+  /** null = create-new-table mode */
+  table: string | null;
+};
+
 export type Tab =
   | QueryTab
   | AgentTab
@@ -62,7 +72,8 @@ export type Tab =
   | ProjectAgentTab
   | MilvusSearchTab
   | RedisKeyTab
-  | RedisConsoleTab;
+  | RedisConsoleTab
+  | TableDesignerTab;
 
 export function milvusSearchTabId(
   connectionId: number,
@@ -78,6 +89,14 @@ export function redisKeyTabId(connectionId: number, db: number, key: string): st
 
 export function redisConsoleTabId(connectionId: number, db: number): string {
   return `redis-console:${connectionId}:${db}`;
+}
+
+export function tableDesignerTabId(
+  connectionId: number,
+  database: string,
+  table: string | null,
+): string {
+  return `table-designer:${connectionId}:${database}:${table ?? "__new__"}`;
 }
 
 export type ProjectAgentId =

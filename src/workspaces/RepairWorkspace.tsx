@@ -457,7 +457,7 @@ function ResultTable({ rows }: { rows: Record<string, unknown>[] }) {
   const shown = rows.slice(0, 20);
   return (
     <div className="overflow-x-auto">
-      <table className="w-full text-[11px] font-mono">
+      <table className="w-full text-[11px] font-mono min-w-[640px]">
         <thead>
           <tr className="text-left text-muted">
             {cols.map((c) => (

@@ -386,7 +386,13 @@ function Empty({ children }: { children: React.ReactNode }) {
 }
 
 function MonoTable({ children }: { children: React.ReactNode }) {
-  return <table className="w-full text-[12px] border-collapse">{children}</table>;
+  return (
+    <div className="overflow-x-auto">
+      <table className="w-full text-[12px] border-collapse min-w-[640px]">
+        {children}
+      </table>
+    </div>
+  );
 }
 
 function Th({ children, right }: { children: React.ReactNode; right?: boolean }) {

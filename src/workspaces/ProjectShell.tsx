@@ -37,6 +37,7 @@ import { ProjectSchemaDiffWorkspace } from "./ProjectSchemaDiffWorkspace";
 import { ProjectSlowQueriesWorkspace } from "./ProjectSlowQueriesWorkspace";
 import { ProjectWorkspace } from "./ProjectWorkspace";
 import { QueryWorkspace } from "./QueryWorkspace";
+import { TableDesignerWorkspace } from "./TableDesignerWorkspace";
 import { parseLookupValue } from "../utils";
 import { formatTime } from "../utils";
 
@@ -61,6 +62,11 @@ type Props = {
   onTablePreview: (t: ProjectTable) => void;
   /** Double-click on a project table — switch to drill tab + adopt root. */
   onTableDrill: (t: ProjectTable) => void;
+  /** Right-click on a project table — designer / copy actions. */
+  onTableContextMenu?: (
+    e: { clientX: number; clientY: number; preventDefault: () => void },
+    t: ProjectTable,
+  ) => void;
   /**
    * Set when App's openProjectDrill fires — ProjectShell adopts this as the
    * lookup root and then calls onAckPendingDrill to clear the slot.
@@ -97,6 +103,7 @@ export function ProjectShell({
   dockOpen,
   onTablePreview,
   onTableDrill,
+  onTableContextMenu,
   pendingDrillTable,
   onAckPendingDrill,
   queryInjections,
@@ -484,6 +491,7 @@ export function ProjectShell({
             filters={treeFilters}
             onTablePreview={onTablePreview}
             onTableDrill={onTableDrill}
+            onTableContextMenu={onTableContextMenu}
           />
         }
         secondary={
@@ -554,6 +562,13 @@ export function ProjectShell({
             injection={queryInjections[activeTab.id] ?? { sql: "SELECT 1", autorun: false, nonce: 0 }}
             onAiInject={() => {}}
             onExecuted={onExecuted}
+          />
+        ) : activeTab?.kind === "table-designer" ? (
+          <TableDesignerWorkspace
+            connectionId={activeTab.connectionId}
+            database={activeTab.database}
+            table={activeTab.table}
+            onApplied={() => onCloseTab(activeTab.id)}
           />
         ) : (
           <ProjectWorkspace

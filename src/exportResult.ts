@@ -75,7 +75,7 @@ export function toMarkdown(result: QueryResult): string {
 // rendered as a single-quoted string with backslash escapes. We deliberately
 // don't try to round-trip MySQL JSON columns into JSON_OBJECT(...) — the
 // resulting text-as-string still loads fine via JSON_VALID().
-function sqlLiteral(v: unknown): string {
+export function sqlLiteral(v: unknown): string {
   if (v === null || v === undefined) return "NULL";
   if (typeof v === "number" && Number.isFinite(v)) return String(v);
   if (typeof v === "boolean") return v ? "1" : "0";
@@ -85,7 +85,7 @@ function sqlLiteral(v: unknown): string {
   return `'${s.replace(/\\/g, "\\\\").replace(/'/g, "\\'").replace(/\r/g, "\\r").replace(/\n/g, "\\n")}'`;
 }
 
-function backtick(name: string): string {
+export function backtick(name: string): string {
   return "`" + name.replace(/`/g, "``") + "`";
 }
 

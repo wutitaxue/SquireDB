@@ -2,6 +2,7 @@ mod agent;
 mod ai;
 mod analyze;
 mod crypto;
+mod ddl;
 mod deadlock;
 mod dictionary;
 mod diff;
@@ -4259,6 +4260,87 @@ async fn regenerate_mcp_token(state: State<'_, AppState>) -> Result<String, Stri
     Ok(token)
 }
 
+#[tauri::command]
+async fn get_table_structure(
+    state: State<'_, AppState>,
+    connection_id: i64,
+    database: String,
+    table: String,
+) -> Result<ddl::TableStructure, String> {
+    let pool = state
+        .active_pools
+        .lock()
+        .await
+        .get(&connection_id)
+        .cloned()
+        .ok_or_else(|| "Connection not open".to_string())?;
+    ddl::get_table_structure(&pool, &database, &table).await
+}
+
+#[tauri::command]
+async fn generate_alter_sql(edit: ddl::TableEdit) -> Result<ddl::AlterPlan, String> {
+    ddl::generate_alter_sql(&edit)
+}
+
+#[tauri::command]
+async fn generate_create_sql(spec: ddl::TableStructure) -> Result<String, String> {
+    ddl::generate_create_sql(&spec)
+}
+
+#[tauri::command]
+async fn execute_ddl(
+    state: State<'_, AppState>,
+    connection_id: i64,
+    sql: String,
+) -> Result<ddl::ExecResult, String> {
+    let pool = state
+        .active_pools
+        .lock()
+        .await
+        .get(&connection_id)
+        .cloned()
+        .ok_or_else(|| "Connection not open".to_string())?;
+    ddl::execute_ddl(&pool, &sql).await
+}
+
+#[tauri::command]
+async fn drop_table(
+    state: State<'_, AppState>,
+    connection_id: i64,
+    database: String,
+    table: String,
+    confirm_token: String,
+) -> Result<ddl::ExecResult, String> {
+    let pool = state
+        .active_pools
+        .lock()
+        .await
+        .get(&connection_id)
+        .cloned()
+        .ok_or_else(|| "Connection not open".to_string())?;
+    ddl::drop_table(&pool, &database, &table, &confirm_token).await
+}
+
+#[tauri::command]
+async fn ai_table_edit(
+    state: State<'_, AppState>,
+    current: ddl::TableStructure,
+    instruction: String,
+) -> Result<ai::TableEditProposal, String> {
+    let (cfg, api_key) = load_active_ai(&state.sqlite).await?;
+    ai::ai_table_edit(&cfg, &api_key, &current, &instruction).await
+}
+
+#[tauri::command]
+async fn ai_create_table(
+    state: State<'_, AppState>,
+    database: String,
+    instruction: String,
+) -> Result<ai::TableCreateProposal, String> {
+    let (cfg, api_key) = load_active_ai(&state.sqlite).await?;
+    ai::ai_create_table(&cfg, &api_key, &database, &instruction).await
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -4446,6 +4528,13 @@ pub fn run() {
             set_mcp_allowed_conns,
             get_mcp_token,
             regenerate_mcp_token,
+            get_table_structure,
+            generate_alter_sql,
+            generate_create_sql,
+            execute_ddl,
+            drop_table,
+            ai_table_edit,
+            ai_create_table,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

@@ -332,7 +332,13 @@ function TableDiffCard({ diff }: { diff: TableDiff }) {
       <div className="font-mono text-[13px] font-semibold text-ink mb-2">
         {diff.name}
       </div>
-      <table className="w-full text-[11.5px] border-collapse">
+      <div className="overflow-x-auto">
+      <table className="w-full text-[11.5px] border-collapse min-w-[600px]">
+        <colgroup>
+          <col style={{ width: 80 }} />
+          <col style={{ width: 200 }} />
+          <col />
+        </colgroup>
         <thead>
           <tr className="bg-panel">
             <th className="text-left px-2 h-7 font-semibold text-muted border-b border-border">
@@ -391,6 +397,7 @@ function TableDiffCard({ diff }: { diff: TableDiff }) {
           ))}
         </tbody>
       </table>
+      </div>
     </div>
   );
 }

@@ -305,7 +305,7 @@ function SlowQueriesTab({
       {error && <ErrorPre>{error}</ErrorPre>}
 
       <div className="border border-border rounded-lg overflow-auto">
-        <table className="w-full text-[12px] border-collapse">
+        <table className="w-full text-[12px] border-collapse min-w-[900px]">
           <thead>
             <tr>
               <th className="sticky top-0 bg-bg-2 border-b border-border text-left px-3 h-8 text-[11px] font-semibold text-muted">
@@ -505,7 +505,7 @@ function ProcesslistTab({ connectionId }: { connectionId: number }) {
       {error && <ErrorPre>{error}</ErrorPre>}
 
       <div className="border border-border rounded-lg overflow-auto">
-        <table className="w-full text-[12px] border-collapse">
+        <table className="w-full text-[12px] border-collapse min-w-[900px]">
           <thead>
             <tr>
               {["ID", "User", "Host", "DB", "Command", "Time", "State", "Info"].map((h) => (
@@ -647,7 +647,7 @@ function VariablesTab({ connectionId }: { connectionId: number }) {
       {error && <ErrorPre>{error}</ErrorPre>}
 
       <div className="border border-border rounded-lg overflow-auto">
-        <table className="w-full text-[12px] border-collapse">
+        <table className="w-full text-[12px] border-collapse min-w-[900px]">
           <thead>
             <tr>
               <th className="sticky top-0 bg-bg-2 border-b border-border text-left px-3 h-8 text-[11px] font-semibold text-muted">
