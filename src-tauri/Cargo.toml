@@ -36,5 +36,6 @@ machine-uid = "0.5"
 rand = "0.8"
 tauri-plugin-dialog = "2.7.1"
 tauri-plugin-fs = "2.5.1"
+tauri-plugin-clipboard-manager = "2"
 redis = { version = "0.27", features = ["tokio-comp", "connection-manager"] }
 

@@ -1,5 +1,7 @@
 import { useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { save as saveDialog } from "@tauri-apps/plugin-dialog";
+import { writeTextFile } from "@tauri-apps/plugin-fs";
 import {
   emptyConnection,
   SYSTEM_DBS,
@@ -15,6 +17,7 @@ import {
   type QuerySuggestion,
   type Relation,
   type RuntimeStatus,
+  type SavedQuery,
   type TableMetaForTree,
 } from "./types";
 import { EditForm } from "./components/EditForm";
@@ -37,6 +40,7 @@ import { DeadlockWorkspace } from "./workspaces/DeadlockWorkspace";
 import { MilvusSearchWorkspace } from "./workspaces/MilvusSearchWorkspace";
 import { TableDesignerWorkspace } from "./workspaces/TableDesignerWorkspace";
 import { DropTableModal } from "./panels/designer/DropTableModal";
+import { SaveQueryModal } from "./components/SaveQueryModal";
 import { RedisExplorerShell } from "./workspaces/RedisExplorerShell";
 import { Titlebar } from "./shell/Titlebar";
 import { Tabbar } from "./shell/Tabbar";
@@ -70,7 +74,7 @@ import {
   type Tab,
 } from "./shell/types";
 import { useContextMenu, type ContextMenuItem } from "./shell/atoms/ContextMenu";
-import { connectionKindMeta, formatTime } from "./utils";
+import { connectionKindMeta, copyText, formatTime } from "./utils";
 
 /**
  * Reused as the fallback injection for any query tab that hasn't been seeded
@@ -128,6 +132,13 @@ function App() {
   const [suggestionsTable, setSuggestionsTable] = useState("");
   const [suggestionsBusy, setSuggestionsBusy] = useState(false);
   const [suggestionsError, setSuggestionsError] = useState("");
+
+  const [savedQueries, setSavedQueries] = useState<SavedQuery[]>([]);
+  const [saveModalState, setSaveModalState] = useState<{
+    connectionId: number;
+    sql: string;
+    existing: SavedQuery | null;
+  } | null>(null);
 
   // Per-workspace tabs. Key = workspaceKey(mode). Home has no tabs.
   const [tabsByMode, setTabsByMode] = useState<
@@ -216,6 +227,7 @@ function App() {
       setHistory([]);
       setAnnotations([]);
       setRelations([]);
+      setSavedQueries([]);
       setLastFocusedQueryTabId(null);
       setServerStatus(null);
       setServerVersion(null);
@@ -231,6 +243,7 @@ function App() {
       setHistory([]);
       setAnnotations([]);
       setRelations([]);
+      setSavedQueries([]);
       setDatabases([]);
       return;
     }
@@ -251,6 +264,7 @@ function App() {
       setHistory([]);
       setAnnotations([]);
       setRelations([]);
+      setSavedQueries([]);
       setServerStatus(null);
       setServerVersion(null);
       return;
@@ -263,6 +277,7 @@ function App() {
       .then((s) => setServerVersion(s.mysql_version))
       .catch(() => {});
     void refreshHistory(workingId);
+    void refreshSavedQueries(workingId);
     void refreshInsights(workingId);
 
     // Ensure this connection workspace has at least one query tab.
@@ -354,6 +369,17 @@ function App() {
       setHistory(list);
     } catch {
       // ignore
+    }
+  }
+
+  async function refreshSavedQueries(connId: number) {
+    try {
+      const list = await invoke<SavedQuery[]>("list_saved_queries", {
+        connectionId: connId,
+      });
+      setSavedQueries(list);
+    } catch {
+      // ignore — sidebar section just stays empty
     }
   }
 
@@ -665,11 +691,7 @@ function App() {
   >(null);
 
   async function copyToClipboard(text: string) {
-    try {
-      await navigator.clipboard.writeText(text);
-    } catch {
-      // Clipboard API can fail in webview without user-gesture chain. Best effort.
-    }
+    await copyText(text);
   }
 
   async function copyCreateTable(connectionId: number, db: string, table: string) {
@@ -686,7 +708,46 @@ function App() {
     }
   }
 
+  async function dumpDatabaseSchema(connectionId: number, db: string): Promise<string | null> {
+    try {
+      return await invoke<string>("dump_database_schema", { connectionId, database: db });
+    } catch (e) {
+      setResult(`Dump schema failed: ${e}`);
+      setIsError(true);
+      return null;
+    }
+  }
+
+  async function copyDatabaseSchema(connectionId: number, db: string) {
+    const sql = await dumpDatabaseSchema(connectionId, db);
+    if (sql) await copyToClipboard(sql);
+  }
+
+  async function exportDatabaseSchema(connectionId: number, db: string) {
+    const sql = await dumpDatabaseSchema(connectionId, db);
+    if (!sql) return;
+    const stamp = new Date()
+      .toISOString()
+      .replace(/[-:T]/g, "")
+      .slice(0, 15)
+      .replace(/(\d{8})(\d{6})/, "$1-$2");
+    const safeDb = db.replace(/[^a-zA-Z0-9_.-]/g, "_");
+    const defaultName = `${safeDb}_schema_${stamp}.sql`;
+    try {
+      const path = await saveDialog({
+        defaultPath: defaultName,
+        filters: [{ name: "SQL", extensions: ["sql"] }],
+      });
+      if (!path) return;
+      await writeTextFile(path, sql);
+    } catch (e) {
+      setResult(`Export schema failed: ${e}`);
+      setIsError(true);
+    }
+  }
+
   const tableMenu = useContextMenu();
+  const savedQueryMenu = useContextMenu();
 
   function tableMenuItems(
     connectionId: number,
@@ -743,6 +804,18 @@ function App() {
         icon: "⎘",
         label: "Copy database name",
         onClick: () => void copyToClipboard(db),
+      },
+      {
+        kind: "action",
+        icon: "⎘",
+        label: "Copy schema (all tables)",
+        onClick: () => void copyDatabaseSchema(connectionId, db),
+      },
+      {
+        kind: "action",
+        icon: "⤓",
+        label: "Export schema…",
+        onClick: () => void exportDatabaseSchema(connectionId, db),
       },
     ];
   }
@@ -1013,6 +1086,137 @@ function App() {
       { id, kind: "query", name: `query-${n}.sql`, connectionId: workingId },
     ]);
     setActiveTabId(id);
+  }
+
+  function openSavedQuery(q: SavedQuery) {
+    // Saved queries are connection-scoped. In Connection mode, just open a new
+    // tab in the active workspace if we're already on that connection;
+    // otherwise switch first.
+    if (mode.kind === "connection" && mode.connectionId === q.connection_id) {
+      const id = `query:${Date.now()}`;
+      setTabsByMode((m) => {
+        const key = workspaceKey(mode);
+        const cur = m[key] ?? { tabs: [], activeTabId: null };
+        const n = cur.tabs.filter((t) => t.kind === "query").length + 1;
+        return {
+          ...m,
+          [key]: {
+            tabs: [
+              ...cur.tabs,
+              {
+                id,
+                kind: "query",
+                name: q.name || `query-${n}.sql`,
+                connectionId: q.connection_id,
+              },
+            ],
+            activeTabId: id,
+          },
+        };
+      });
+      setQueryInjections((inj) => ({
+        ...inj,
+        [id]: { sql: q.sql, autorun: false, nonce: Date.now() },
+      }));
+      return;
+    }
+    // Project mode: open a new tab in the project workspace bound to this conn
+    if (mode.kind === "project") {
+      const id = `query:${Date.now()}`;
+      setTabsByMode((m) => {
+        const key = workspaceKey(mode);
+        const cur = m[key] ?? { tabs: [], activeTabId: null };
+        const n = cur.tabs.filter((t) => t.kind === "query").length + 1;
+        return {
+          ...m,
+          [key]: {
+            tabs: [
+              ...cur.tabs,
+              {
+                id,
+                kind: "query",
+                name: q.name || `query-${n}.sql`,
+                connectionId: q.connection_id,
+              },
+            ],
+            activeTabId: id,
+          },
+        };
+      });
+      setQueryInjections((inj) => ({
+        ...inj,
+        [id]: { sql: q.sql, autorun: false, nonce: Date.now() },
+      }));
+      return;
+    }
+    // Home mode is unreachable in practice — the saved-queries sidebar
+    // section only renders inside connection / project workspaces.
+  }
+
+  function requestSaveQuery(connectionId: number, sql: string) {
+    if (!sql.trim()) return;
+    setSaveModalState({ connectionId, sql, existing: null });
+  }
+
+  function defaultSavedQueryName(sql: string): string {
+    const firstLine = sql
+      .split("\n")
+      .find((l) => l.trim().length > 0)
+      ?.trim()
+      .replace(/\s+/g, " ")
+      .slice(0, 50);
+    return firstLine ?? "";
+  }
+
+  function onSavedQuerySaved(q: SavedQuery) {
+    setSaveModalState(null);
+    setSavedQueries((prev) => {
+      const without = prev.filter((p) => p.id !== q.id);
+      return [...without, q].sort((a, b) =>
+        a.name.localeCompare(b.name, undefined, { sensitivity: "base" }),
+      );
+    });
+    // Project sidebar lives in ProjectShell with its own saved-query list —
+    // bump refreshKey so it re-fetches.
+    setProjectRefreshKey((k) => k + 1);
+  }
+
+  function renameSavedQuery(q: SavedQuery) {
+    setSaveModalState({ connectionId: q.connection_id, sql: q.sql, existing: q });
+  }
+
+  async function deleteSavedQuery(q: SavedQuery) {
+    if (!window.confirm(`Delete saved query “${q.name}”?`)) return;
+    try {
+      await invoke("delete_saved_query", { id: q.id });
+      setSavedQueries((prev) => prev.filter((p) => p.id !== q.id));
+      setProjectRefreshKey((k) => k + 1);
+    } catch (e) {
+      window.alert(`Delete failed: ${e}`);
+    }
+  }
+
+  function savedQueryMenuItems(q: SavedQuery): ContextMenuItem[] {
+    return [
+      {
+        kind: "action",
+        icon: "✎",
+        label: "Rename…",
+        onClick: () => renameSavedQuery(q),
+      },
+      { kind: "separator" },
+      {
+        kind: "action",
+        icon: "🗑",
+        label: "Delete",
+        danger: true,
+        onClick: () => void deleteSavedQuery(q),
+      },
+    ];
+  }
+
+  function handleSavedQueryContextMenu(q: SavedQuery, e: React.MouseEvent) {
+    savedQueryMenu.open(e, savedQueryMenuItems(q));
   }
 
   const visibleDbs = showSystemDbs ? databases : databases.filter((d) => !SYSTEM_DBS.has(d));
@@ -1438,6 +1642,9 @@ function App() {
                   piiCount={piiTables.size}
                   relationsCount={relations.length}
                   tablesCount={tablesCount}
+                  savedQueries={savedQueries}
+                  onOpenSavedQuery={openSavedQuery}
+                  onSavedQueryContextMenu={handleSavedQueryContextMenu}
                   history={history}
                   onUseHistory={injectFromAi}
                 />
@@ -1482,6 +1689,7 @@ function App() {
                         injection={queryInjections[tab.id] ?? initialInjection}
                         onAiInject={stableInjectFromAi}
                         onExecuted={stableOnQueryExecuted}
+                        onRequestSaveQuery={requestSaveQuery}
                       />
                     </div>
                   ))}
@@ -1538,6 +1746,9 @@ function App() {
             onAckPendingDrill={() => setPendingDrillTable(null)}
             queryInjections={queryInjections}
             onExecuted={stableOnQueryExecuted}
+            onRequestSaveQuery={requestSaveQuery}
+            onOpenSavedQuery={openSavedQuery}
+            onSavedQueryContextMenu={handleSavedQueryContextMenu}
             refreshKey={projectRefreshKey}
           />
         )}
@@ -1684,7 +1895,18 @@ function App() {
           }}
         />
       )}
+      {saveModalState && (
+        <SaveQueryModal
+          connectionId={saveModalState.connectionId}
+          sql={saveModalState.sql}
+          existing={saveModalState.existing}
+          defaultName={defaultSavedQueryName(saveModalState.sql)}
+          onClose={() => setSaveModalState(null)}
+          onSaved={onSavedQuerySaved}
+        />
+      )}
       {tableMenu.element}
+      {savedQueryMenu.element}
     </div>
   );
 }

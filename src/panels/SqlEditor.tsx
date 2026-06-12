@@ -54,7 +54,6 @@ const editorTheme = EditorView.theme(
     "&": {
       background: "var(--panel-2)",
       color: "var(--ink)",
-      height: "100%",
     },
     ".cm-scroller": {
       fontFamily: "var(--font-mono)",
@@ -152,7 +151,6 @@ export function SqlEditor({ value, onChange, onRun, readOnly, schema }: Props) {
       extensions={extensions}
       readOnly={readOnly}
       basicSetup={basicSetup}
-      height="100%"
     />
   );
 }

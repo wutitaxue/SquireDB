@@ -7,6 +7,7 @@ import type {
   EmbeddingProvider,
   McpStatus,
 } from "../types";
+import { copyText } from "../utils";
 
 type TabKind = "chat" | "embedding" | "mcp";
 
@@ -953,12 +954,12 @@ function McpForm({ onClose }: { onClose: () => void }) {
   }
 
   async function copy(text: string, what: string) {
-    try {
-      await navigator.clipboard.writeText(text);
+    const ok = await copyText(text);
+    if (ok) {
       setNotice(`Copied ${what} to clipboard.`);
       setError("");
-    } catch (e) {
-      setError(`Copy failed: ${e}`);
+    } else {
+      setError("Copy failed: clipboard write was rejected");
     }
   }
 

@@ -1308,3 +1308,12 @@ export type TableCreateProposal = {
   structure: TableStructure;
   summary: string;
 };
+
+export type SavedQuery = {
+  id: number;
+  connection_id: number;
+  name: string;
+  sql: string;
+  created_at: string;
+  updated_at: string;
+};

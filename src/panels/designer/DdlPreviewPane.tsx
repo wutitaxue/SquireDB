@@ -1,4 +1,5 @@
 import type { AlterPlan, Risk } from "../../types";
+import { copyText } from "../../utils";
 
 type Mode = "edit" | "create";
 
@@ -41,11 +42,7 @@ export function DdlPreviewPane({
   const hasSomething = sql.trim().length > 0;
 
   async function copySql() {
-    try {
-      await navigator.clipboard.writeText(sql);
-    } catch {
-      // best effort
-    }
+    await copyText(sql);
   }
 
   return (

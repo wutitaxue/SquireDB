@@ -13,6 +13,7 @@ pub mod mcp_settings;
 pub mod project;
 pub mod relation;
 pub mod repair;
+pub mod saved_query;
 pub mod settings;
 
 pub async fn init_pool(db_path: &Path) -> Result<SqlitePool, sqlx::Error> {
@@ -224,6 +225,28 @@ async fn init_schema(pool: &SqlitePool) -> Result<(), sqlx::Error> {
 
     sqlx::query(
         "CREATE INDEX IF NOT EXISTS idx_drill_history_proj ON drill_history(project_id, id DESC)",
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS saved_queries (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            connection_id INTEGER NOT NULL,
+            name TEXT NOT NULL,
+            sql TEXT NOT NULL,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE(connection_id, name)
+        )
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_saved_queries_conn ON saved_queries(connection_id, name COLLATE NOCASE)",
     )
     .execute(pool)
     .await?;

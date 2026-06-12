@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import type { Annotation, TableCommentReport } from "../types";
+import { copyText } from "../utils";
 import {
   AgentPanel,
   Card,
@@ -147,7 +148,7 @@ export function DictionaryWorkspace({ connectionId, databases, onClose }: Props)
         connectionId,
         database: null,
       });
-      await navigator.clipboard.writeText(md);
+      await copyText(md);
     } catch (e) {
       setError(String(e));
     }

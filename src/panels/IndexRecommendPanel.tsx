@@ -1,4 +1,5 @@
 import type { IndexRecommendations } from "../types";
+import { copyText } from "../utils";
 
 export function IndexRecommendPanel({
   recs,
@@ -71,7 +72,7 @@ export function IndexRecommendPanel({
             <div style={{ display: "flex", gap: 6 }}>
               <button
                 onClick={() => {
-                  void navigator.clipboard.writeText(r.alter_sql);
+                  void copyText(r.alter_sql);
                 }}
                 style={{ fontSize: 11, padding: "2px 8px" }}
               >

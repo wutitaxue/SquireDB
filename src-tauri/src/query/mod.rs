@@ -492,8 +492,10 @@ pub fn value_to_json(row: &MySqlRow, idx: usize) -> serde_json::Value {
             .try_get::<String, _>(idx)
             .map(serde_json::Value::from)
             .or_else(|_| {
-                row.try_get::<Vec<u8>, _>(idx)
-                    .map(|v| serde_json::Value::from(format!("<binary {} bytes>", v.len())))
+                row.try_get::<Vec<u8>, _>(idx).map(|v| match std::str::from_utf8(&v) {
+                    Ok(s) => serde_json::Value::from(s.to_string()),
+                    Err(_) => serde_json::Value::from(format!("<binary {} bytes>", v.len())),
+                })
             })
             .unwrap_or(serde_json::Value::Null),
     }

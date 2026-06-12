@@ -1,6 +1,7 @@
 import { formatTime } from "../../utils";
-import type { HistoryEntry, QuerySuggestion } from "../../types";
+import type { HistoryEntry, QuerySuggestion, SavedQuery } from "../../types";
 import { Section } from "../atoms/Section";
+import { SavedQueriesSection } from "../atoms/SavedQueriesSection";
 
 type Props = {
   databases: string[];
@@ -17,6 +18,10 @@ type Props = {
   piiCount: number;
   relationsCount: number;
   tablesCount: number;
+
+  savedQueries: SavedQuery[];
+  onOpenSavedQuery: (q: SavedQuery) => void;
+  onSavedQueryContextMenu?: (q: SavedQuery, e: React.MouseEvent) => void;
 
   history: HistoryEntry[];
   onUseHistory: (sql: string) => void;
@@ -35,6 +40,9 @@ export function ConnSecondary(props: Props) {
     piiCount,
     relationsCount,
     tablesCount,
+    savedQueries,
+    onOpenSavedQuery,
+    onSavedQueryContextMenu,
     history,
     onUseHistory,
   } = props;
@@ -42,12 +50,14 @@ export function ConnSecondary(props: Props) {
   const hasSuggestions =
     suggestionsBusy || suggestions.length > 0 || !!suggestionsError;
   const hasSchemaStatus = annotationsCount > 0 || relationsCount > 0;
+  const hasSaved = savedQueries.length > 0;
 
   if (
     databases.length === 0 &&
     history.length === 0 &&
     !hasSuggestions &&
-    !hasSchemaStatus
+    !hasSchemaStatus &&
+    !hasSaved
   ) {
     return null;
   }
@@ -132,6 +142,12 @@ export function ConnSecondary(props: Props) {
         </Section>
         </div>
       )}
+
+      <SavedQueriesSection
+        queries={savedQueries}
+        onOpen={onOpenSavedQuery}
+        onContextMenu={onSavedQueryContextMenu}
+      />
 
       {history.length > 0 && (
         <div className="flex-1 min-h-0 overflow-y-auto">

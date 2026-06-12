@@ -4288,6 +4288,84 @@ async fn generate_create_sql(spec: ddl::TableStructure) -> Result<String, String
 }
 
 #[tauri::command]
+async fn dump_database_schema(
+    state: State<'_, AppState>,
+    connection_id: i64,
+    database: String,
+) -> Result<String, String> {
+    let pool = state
+        .active_pools
+        .lock()
+        .await
+        .get(&connection_id)
+        .cloned()
+        .ok_or_else(|| "Connection not open".to_string())?;
+    ddl::dump_database_schema(&pool, &database).await
+}
+
+#[tauri::command]
+async fn save_query(
+    state: State<'_, AppState>,
+    connection_id: i64,
+    name: String,
+    sql: String,
+) -> Result<storage::saved_query::SavedQuery, String> {
+    let name = name.trim().to_string();
+    if name.is_empty() {
+        return Err("Name cannot be empty".into());
+    }
+    if sql.trim().is_empty() {
+        return Err("SQL cannot be empty".into());
+    }
+    storage::saved_query::create(&state.sqlite, connection_id, &name, &sql)
+        .await
+        .map_err(|e| format!("save query failed: {e}"))
+}
+
+#[tauri::command]
+async fn list_saved_queries(
+    state: State<'_, AppState>,
+    connection_id: i64,
+) -> Result<Vec<storage::saved_query::SavedQuery>, String> {
+    storage::saved_query::list(&state.sqlite, connection_id)
+        .await
+        .map_err(|e| format!("list saved queries failed: {e}"))
+}
+
+#[tauri::command]
+async fn list_saved_queries_for_connections(
+    state: State<'_, AppState>,
+    connection_ids: Vec<i64>,
+) -> Result<Vec<storage::saved_query::SavedQuery>, String> {
+    storage::saved_query::list_for_connections(&state.sqlite, &connection_ids)
+        .await
+        .map_err(|e| format!("list saved queries failed: {e}"))
+}
+
+#[tauri::command]
+async fn update_saved_query(
+    state: State<'_, AppState>,
+    id: i64,
+    name: String,
+    sql: String,
+) -> Result<storage::saved_query::SavedQuery, String> {
+    let name = name.trim().to_string();
+    if name.is_empty() {
+        return Err("Name cannot be empty".into());
+    }
+    storage::saved_query::update(&state.sqlite, id, &name, &sql)
+        .await
+        .map_err(|e| format!("update saved query failed: {e}"))
+}
+
+#[tauri::command]
+async fn delete_saved_query(state: State<'_, AppState>, id: i64) -> Result<(), String> {
+    storage::saved_query::delete(&state.sqlite, id)
+        .await
+        .map_err(|e| format!("delete saved query failed: {e}"))
+}
+
+#[tauri::command]
 async fn execute_ddl(
     state: State<'_, AppState>,
     connection_id: i64,
@@ -4347,6 +4425,7 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_fs::init())
+        .plugin(tauri_plugin_clipboard_manager::init())
         .setup(|app| {
             let app_data_dir = app.path().app_data_dir()?;
             fs::create_dir_all(&app_data_dir)?;
@@ -4531,6 +4610,12 @@ pub fn run() {
             get_table_structure,
             generate_alter_sql,
             generate_create_sql,
+            dump_database_schema,
+            save_query,
+            list_saved_queries,
+            list_saved_queries_for_connections,
+            update_saved_query,
+            delete_saved_query,
             execute_ddl,
             drop_table,
             ai_table_edit,

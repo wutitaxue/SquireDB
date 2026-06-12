@@ -1,6 +1,7 @@
 import { useMemo } from "react";
-import type { Connection, ProjectRelation } from "../../types";
+import type { Connection, ProjectRelation, SavedQuery } from "../../types";
 import { Section } from "../atoms/Section";
+import { SavedQueriesSection } from "../atoms/SavedQueriesSection";
 
 type Props = {
   relations: ProjectRelation[];
@@ -13,6 +14,9 @@ type Props = {
   onOpenConn: (id: number) => void;
   onOpenAllMissing: () => void;
   onRemoveRelation: (id: number) => void;
+  savedQueries: SavedQuery[];
+  onOpenSavedQuery: (q: SavedQuery) => void;
+  onSavedQueryContextMenu?: (q: SavedQuery, e: React.MouseEvent) => void;
 };
 
 export function ProjectSecondary({
@@ -25,6 +29,9 @@ export function ProjectSecondary({
   onOpenConn,
   onOpenAllMissing,
   onRemoveRelation,
+  savedQueries,
+  onOpenSavedQuery,
+  onSavedQueryContextMenu,
 }: Props) {
   const connLabel = useMemo(() => {
     const m = new Map<number, string>();
@@ -34,12 +41,24 @@ export function ProjectSecondary({
     return (id: number) => m.get(id) ?? `#${id}`;
   }, [connections]);
 
-  if (relations.length === 0 && requiredConnIds.length === 0) {
+  if (
+    relations.length === 0 &&
+    requiredConnIds.length === 0 &&
+    savedQueries.length === 0
+  ) {
     return null;
   }
 
   return (
     <>
+      <SavedQueriesSection
+        queries={savedQueries}
+        connections={connections}
+        groupByConnection
+        onOpen={onOpenSavedQuery}
+        onContextMenu={onSavedQueryContextMenu}
+      />
+
       <div className="flex-1 min-h-0 overflow-y-auto">
       <Section title={`Relations [${relations.length}]`} flush>
         {relations.length === 0 ? (

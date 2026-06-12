@@ -6,6 +6,7 @@ import type {
   MigrationStatement,
   TableDiff,
 } from "../types";
+import { copyText } from "../utils";
 import {
   AgentPanel,
   Card,
@@ -111,7 +112,7 @@ export function SchemaDiffWorkspace({
   function copyAll() {
     if (!report) return;
     const text = report.migrations.map((m) => m.sql).join("\n\n");
-    void navigator.clipboard.writeText(text);
+    void copyText(text);
   }
 
   function swapDirection() {
@@ -434,7 +435,7 @@ function MigrationRow({
         <code className="text-[12px] font-mono text-ink-2">{migration.table}</code>
         {risk && tone && <SevPill tone={tone}>{risk.level}</SevPill>}
         <div className="flex-1" />
-        <SecondaryButton onClick={() => void navigator.clipboard.writeText(migration.sql)}>
+        <SecondaryButton onClick={() => void copyText(migration.sql)}>
           Copy
         </SecondaryButton>
         <SecondaryButton onClick={() => onInjectSql(migration.sql)}>Inject</SecondaryButton>

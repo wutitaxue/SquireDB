@@ -12,7 +12,7 @@ import type {
   MutationResult,
   QueryResult,
 } from "../types";
-import { isImeComposing, parseLookupValue, renderCell } from "../utils";
+import { copyText, isImeComposing, parseLookupValue, renderCell } from "../utils";
 import {
   EXPORT_FORMAT_META,
   backtick,
@@ -383,13 +383,13 @@ function ResultsPaneImpl(props: Props) {
       const vals = row.map((cell) => sqlLiteral(cell)).join(", ");
       return `INSERT INTO ${tableRef} (${cols}) VALUES (${vals});`;
     });
-    try {
-      await navigator.clipboard.writeText(lines.join("\n") + "\n");
+    const ok = await copyText(lines.join("\n") + "\n");
+    if (ok) {
       setMutationError("");
       setMutationStatus(`✓ Copied ${rows.length} INSERT statement${rows.length > 1 ? "s" : ""} to clipboard`);
       setCopyFlash("insert");
-    } catch (e) {
-      setMutationError(`Copy failed: ${e}`);
+    } else {
+      setMutationError("Copy failed: clipboard write was rejected");
     }
   }
 
@@ -419,13 +419,13 @@ function ResultsPaneImpl(props: Props) {
         .join(" AND ");
       return `UPDATE ${tableRef} SET ${setClause} WHERE ${whereClause};`;
     });
-    try {
-      await navigator.clipboard.writeText(lines.join("\n") + "\n");
+    const ok = await copyText(lines.join("\n") + "\n");
+    if (ok) {
       setMutationError("");
       setMutationStatus(`✓ Copied ${rows.length} UPDATE statement${rows.length > 1 ? "s" : ""} to clipboard`);
       setCopyFlash("update");
-    } catch (e) {
-      setMutationError(`Copy failed: ${e}`);
+    } else {
+      setMutationError("Copy failed: clipboard write was rejected");
     }
   }
 

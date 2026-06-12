@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
-import { isImeComposing, parseLookupValue } from "../utils";
+import { copyText, isImeComposing, parseLookupValue } from "../utils";
 
 type Props = {
   rowIdx: number;
@@ -213,7 +213,7 @@ export function CellViewer(props: Props) {
       detection.kind === "json"
         ? (detection.pretty ?? "")
         : (raw ?? "");
-    navigator.clipboard.writeText(text).then(() => {
+    void copyText(text).then(() => {
       setCopied(true);
       setTimeout(() => setCopied(false), 1200);
     });

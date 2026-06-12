@@ -28,6 +28,7 @@ import {
   SevPill,
   type SevTone,
 } from "../shell/AgentPanel";
+import { copyText } from "../utils";
 
 const HEALTH_EXPORT_FORMATS: HealthExportFormat[] = ["html", "markdown"];
 
@@ -84,7 +85,7 @@ export function HealthCheckWorkspace({ connectionId, onClose }: Props) {
 
   function copyMarkdown() {
     if (!response) return;
-    void navigator.clipboard.writeText(toConnectionHealthMarkdown(response));
+    void copyText(toConnectionHealthMarkdown(response));
     setExportNotice("Markdown copied to clipboard.");
   }
 

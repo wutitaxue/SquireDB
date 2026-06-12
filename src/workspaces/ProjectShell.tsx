@@ -9,6 +9,7 @@ import type {
   Project,
   ProjectRelation,
   ProjectTable,
+  SavedQuery,
 } from "../types";
 import type {
   DrillHistoryEntry,
@@ -78,6 +79,12 @@ type Props = {
   /** Query tab injection map keyed by tab id. */
   queryInjections: Record<string, Injection>;
   onExecuted: (connId: number) => void;
+  /** Save button in QueryWorkspace → opens the SaveQueryModal owned by App. */
+  onRequestSaveQuery: (connectionId: number, sql: string) => void;
+  /** Click a saved query in the sidebar → opens a new query tab. */
+  onOpenSavedQuery: (q: SavedQuery) => void;
+  /** Right-click a saved query → caller opens the rename / delete menu. */
+  onSavedQueryContextMenu?: (q: SavedQuery, e: React.MouseEvent) => void;
 
   /**
    * Bump from the outside to force a refresh of project tables / relations
@@ -108,12 +115,16 @@ export function ProjectShell({
   onAckPendingDrill,
   queryInjections,
   onExecuted,
+  onRequestSaveQuery,
+  onOpenSavedQuery,
+  onSavedQueryContextMenu,
   refreshKey,
 }: Props) {
   const [tables, setTables] = useState<ProjectTable[]>([]);
   const [relations, setRelations] = useState<ProjectRelation[]>([]);
   const [openConnIds, setOpenConnIds] = useState<Set<number>>(new Set());
   const [unlockingAll, setUnlockingAll] = useState(false);
+  const [savedQueries, setSavedQueries] = useState<SavedQuery[]>([]);
 
   const [lookupTable, setLookupTable] = useState<ProjectTable | null>(null);
   const [columns, setColumns] = useState<string[]>([]);
@@ -234,6 +245,26 @@ export function ProjectShell({
       connsTotal: requiredConnIds.size,
     });
   }, [tables.length, requiredConnIds, missingConnIds, onStatsChange]);
+
+  useEffect(() => {
+    if (requiredConnIdsArr.length === 0) {
+      setSavedQueries([]);
+      return;
+    }
+    let cancelled = false;
+    invoke<SavedQuery[]>("list_saved_queries_for_connections", {
+      connectionIds: requiredConnIdsArr,
+    })
+      .then((list) => {
+        if (!cancelled) setSavedQueries(list);
+      })
+      .catch(() => {
+        if (!cancelled) setSavedQueries([]);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [requiredConnIdsArr, refreshKey]);
 
   useEffect(() => {
     let cancelled = false;
@@ -505,6 +536,9 @@ export function ProjectShell({
             onOpenConn={(id) => void openConn(id)}
             onOpenAllMissing={() => void openAllMissing()}
             onRemoveRelation={(id) => void removeRelation(id)}
+            savedQueries={savedQueries}
+            onOpenSavedQuery={onOpenSavedQuery}
+            onSavedQueryContextMenu={onSavedQueryContextMenu}
           />
         }
       />
@@ -562,6 +596,7 @@ export function ProjectShell({
             injection={queryInjections[activeTab.id] ?? { sql: "SELECT 1", autorun: false, nonce: 0 }}
             onAiInject={() => {}}
             onExecuted={onExecuted}
+            onRequestSaveQuery={onRequestSaveQuery}
           />
         ) : activeTab?.kind === "table-designer" ? (
           <TableDesignerWorkspace

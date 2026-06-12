@@ -19,6 +19,7 @@ import {
   SevPill,
   type SevTone,
 } from "../shell/AgentPanel";
+import { copyText } from "../utils";
 
 type Props = {
   projectId: number;
@@ -492,7 +493,7 @@ function MigrationsCard({
 
   function copyAll() {
     const text = migrations.map((m) => m.sql).join("\n\n");
-    if (text) void navigator.clipboard?.writeText(text);
+    if (text) void copyText(text);
   }
 
   return (

@@ -18,11 +18,13 @@ type Props = {
   injection: Injection;
   onAiInject: (sql: string) => void;
   onExecuted: (connId: number) => void;
+  onRequestSaveQuery: (connectionId: number, sql: string) => void;
 };
 
 function QueryWorkspaceImpl({
   conn,
   injection,
+  onRequestSaveQuery,
   onAiInject,
   onExecuted,
 }: Props) {
@@ -230,18 +232,15 @@ function QueryWorkspaceImpl({
         {breadcrumb}
         <div className="flex-1" />
         <button
-          disabled
-          title="Coming soon"
-          className="h-6 px-2 text-[11px] text-ink-2 bg-panel border border-border rounded-md disabled:opacity-60 disabled:cursor-not-allowed"
+          onClick={() => {
+            if (!conn.id) return;
+            onRequestSaveQuery(conn.id, sql);
+          }}
+          disabled={!sql.trim() || !conn.id}
+          title="Save this SQL for later (Cmd+S)"
+          className="h-6 px-2 text-[11px] text-ink-2 bg-panel border border-border rounded-md hover:bg-bg-2 disabled:opacity-60 disabled:cursor-not-allowed"
         >
-          Save
-        </button>
-        <button
-          disabled
-          title="Coming soon"
-          className="h-6 px-2 text-[11px] text-ink-2 bg-panel border border-border rounded-md disabled:opacity-60 disabled:cursor-not-allowed"
-        >
-          History
+          ⭐ Save
         </button>
         <span className="h-4 w-px bg-border" />
         {running ? (
@@ -266,10 +265,10 @@ function QueryWorkspaceImpl({
       </div>
 
       <div
-        className="flex flex-col bg-panel-2 border-b border-border shrink-0"
+        className="flex flex-col bg-panel-2 border-b border-border shrink-0 overflow-hidden"
         style={{ height: "34%", minHeight: 180, maxHeight: "60%" }}
       >
-        <div className="flex-1 min-h-0">
+        <div className="flex-1 min-h-0 overflow-y-auto">
           <SqlEditor value={sql} onChange={setSql} onRun={stableRun} />
         </div>
         <div className="px-2 py-2 bg-panel-2 border-t border-border shrink-0">

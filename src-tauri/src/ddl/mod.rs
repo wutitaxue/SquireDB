@@ -877,3 +877,47 @@ pub async fn drop_table(
         elapsed_ms: started.elapsed().as_millis() as u64,
     })
 }
+
+/// Dump every BASE TABLE in `database` as a repeatable .sql script.
+/// Each table is emitted as `DROP TABLE IF EXISTS … ;` + the engine's own
+/// `SHOW CREATE TABLE` output. Views, routines, triggers, and events are
+/// intentionally excluded — this matches the menu's "导出库结构" scope.
+pub async fn dump_database_schema(pool: &MySqlPool, database: &str) -> Result<String, String> {
+    let tables: Vec<(String,)> = sqlx::query_as(
+        "SELECT CAST(TABLE_NAME AS CHAR) \
+         FROM information_schema.TABLES \
+         WHERE TABLE_SCHEMA = ? AND TABLE_TYPE = 'BASE TABLE' \
+         ORDER BY TABLE_NAME",
+    )
+    .bind(database)
+    .fetch_all(pool)
+    .await
+    .map_err(|e| format!("list tables failed: {e}"))?;
+
+    let stamp = chrono::Utc::now().format("%Y-%m-%d %H:%M:%S UTC").to_string();
+    let mut out = String::new();
+    out.push_str(&format!(
+        "-- SquireDB schema dump\n-- Database: {}\n-- Generated: {}\n-- Tables: {}\n\nSET FOREIGN_KEY_CHECKS = 0;\n\n",
+        database,
+        stamp,
+        tables.len()
+    ));
+
+    for (table,) in tables {
+        let db_clean = database.replace('`', "");
+        let table_clean = table.replace('`', "");
+        let sql = format!("SHOW CREATE TABLE `{db_clean}`.`{table_clean}`");
+        let row: (String, String) = sqlx::query_as(&sql)
+            .fetch_one(pool)
+            .await
+            .map_err(|e| format!("SHOW CREATE TABLE `{database}`.`{table}`: {e}"))?;
+        out.push_str(&format!(
+            "-- ----------------------------\n-- Table structure for {table}\n-- ----------------------------\nDROP TABLE IF EXISTS {};\n{};\n\n",
+            quote_ident(&table),
+            row.1
+        ));
+    }
+
+    out.push_str("SET FOREIGN_KEY_CHECKS = 1;\n");
+    Ok(out)
+}

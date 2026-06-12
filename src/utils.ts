@@ -1,5 +1,31 @@
 import type { CSSProperties, KeyboardEvent as ReactKeyboardEvent } from "react";
+import { writeText as tauriWriteText } from "@tauri-apps/plugin-clipboard-manager";
 import type { ConnectionKind, InvolvedTableRef, TableAccess } from "./types";
+
+/**
+ * Write text to the system clipboard via Tauri's clipboard-manager plugin.
+ * Goes through the native bridge so it doesn't depend on the webview's
+ * user-gesture window — works even after multiple `await invoke()` round-trips
+ * (which silently break `navigator.clipboard.writeText` on WKWebView).
+ *
+ * Falls back to `navigator.clipboard.writeText` only if the plugin path
+ * throws (e.g. running in a plain browser preview without the bridge).
+ */
+export async function copyText(text: string): Promise<boolean> {
+  try {
+    await tauriWriteText(text);
+    return true;
+  } catch (e) {
+    console.warn("clipboard-manager writeText failed, falling back", e);
+    try {
+      await navigator.clipboard.writeText(text);
+      return true;
+    } catch (e2) {
+      console.warn("navigator.clipboard.writeText also failed", e2);
+      return false;
+    }
+  }
+}
 
 /**
  * Display metadata for a connection kind. Used by Home cards, Titlebar
