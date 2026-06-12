@@ -1,6 +1,7 @@
 mod agent;
 mod ai;
 mod analyze;
+mod cache;
 mod crypto;
 mod ddl;
 mod deadlock;
@@ -2162,8 +2163,10 @@ async fn drill_project(
     // right connection. Cross-connection projects rely on this — relations
     // may target tables on other connection_ids than the lookup root.
     let pools = state.active_pools.lock().await.clone();
+    let redis_mgrs = state.active_redis.lock().await.clone();
     let result = drill::drill(
         &pools,
+        &redis_mgrs,
         &state.sqlite,
         project_id,
         connection_id,
@@ -4366,6 +4369,98 @@ async fn delete_saved_query(state: State<'_, AppState>, id: i64) -> Result<(), S
 }
 
 #[tauri::command]
+async fn list_project_cache_mappings(
+    state: State<'_, AppState>,
+    project_id: i64,
+) -> Result<Vec<storage::project_cache::ProjectCacheMapping>, String> {
+    storage::project_cache::list(&state.sqlite, project_id)
+        .await
+        .map_err(|e| format!("list project cache mappings failed: {e}"))
+}
+
+#[tauri::command]
+async fn create_project_cache_mapping(
+    state: State<'_, AppState>,
+    project_id: i64,
+    mysql_connection_id: i64,
+    mysql_database: String,
+    mysql_table: String,
+    redis_connection_id: i64,
+    redis_db: i64,
+    key_pattern: String,
+    command: String,
+    label: Option<String>,
+) -> Result<storage::project_cache::ProjectCacheMapping, String> {
+    let cmd = command.trim().to_uppercase();
+    if !matches!(cmd.as_str(), "GET" | "HGETALL" | "LRANGE" | "SMEMBERS" | "ZRANGE") {
+        return Err(format!("unsupported command `{cmd}`"));
+    }
+    if !(0..=15).contains(&redis_db) {
+        return Err(format!("redis db must be 0..15, got {redis_db}"));
+    }
+    if cache::parse_placeholders(&key_pattern).is_empty() {
+        return Err("key pattern must contain at least one `{column}` placeholder".to_string());
+    }
+    let lbl = label.as_deref().map(str::trim).filter(|s| !s.is_empty());
+    storage::project_cache::create(
+        &state.sqlite,
+        project_id,
+        mysql_connection_id,
+        &mysql_database,
+        &mysql_table,
+        redis_connection_id,
+        redis_db,
+        key_pattern.trim(),
+        &cmd,
+        lbl,
+    )
+    .await
+    .map_err(|e| format!("create project cache mapping failed: {e}"))
+}
+
+#[tauri::command]
+async fn update_project_cache_mapping(
+    state: State<'_, AppState>,
+    id: i64,
+    redis_db: i64,
+    key_pattern: String,
+    command: String,
+    label: Option<String>,
+) -> Result<storage::project_cache::ProjectCacheMapping, String> {
+    let cmd = command.trim().to_uppercase();
+    if !matches!(cmd.as_str(), "GET" | "HGETALL" | "LRANGE" | "SMEMBERS" | "ZRANGE") {
+        return Err(format!("unsupported command `{cmd}`"));
+    }
+    if !(0..=15).contains(&redis_db) {
+        return Err(format!("redis db must be 0..15, got {redis_db}"));
+    }
+    if cache::parse_placeholders(&key_pattern).is_empty() {
+        return Err("key pattern must contain at least one `{column}` placeholder".to_string());
+    }
+    let lbl = label.as_deref().map(str::trim).filter(|s| !s.is_empty());
+    storage::project_cache::update(
+        &state.sqlite,
+        id,
+        redis_db,
+        key_pattern.trim(),
+        &cmd,
+        lbl,
+    )
+    .await
+    .map_err(|e| format!("update project cache mapping failed: {e}"))
+}
+
+#[tauri::command]
+async fn delete_project_cache_mapping(
+    state: State<'_, AppState>,
+    id: i64,
+) -> Result<(), String> {
+    storage::project_cache::delete(&state.sqlite, id)
+        .await
+        .map_err(|e| format!("delete project cache mapping failed: {e}"))
+}
+
+#[tauri::command]
 async fn execute_ddl(
     state: State<'_, AppState>,
     connection_id: i64,
@@ -4616,6 +4711,10 @@ pub fn run() {
             list_saved_queries_for_connections,
             update_saved_query,
             delete_saved_query,
+            list_project_cache_mappings,
+            create_project_cache_mapping,
+            update_project_cache_mapping,
+            delete_project_cache_mapping,
             execute_ddl,
             drop_table,
             ai_table_edit,

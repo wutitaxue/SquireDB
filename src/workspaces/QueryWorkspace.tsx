@@ -216,6 +216,32 @@ function QueryWorkspaceImpl({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [injection.nonce]);
 
+  const containerRef = useRef<HTMLDivElement | null>(null);
+  const sqlRef = useRef(sql);
+  sqlRef.current = sql;
+  const connIdRef = useRef(conn.id);
+  connIdRef.current = conn.id;
+  const onRequestSaveRef = useRef(onRequestSaveQuery);
+  onRequestSaveRef.current = onRequestSaveQuery;
+  useEffect(() => {
+    function onKey(e: KeyboardEvent) {
+      const isSave = (e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "s";
+      if (!isSave) return;
+      // Only the visible workspace instance reacts — inactive tabs are
+      // .hidden (display:none) by the parent, so offsetParent is null.
+      if (!containerRef.current || containerRef.current.offsetParent === null) {
+        return;
+      }
+      e.preventDefault();
+      const s = sqlRef.current;
+      const cid = connIdRef.current;
+      if (!s.trim() || !cid) return;
+      onRequestSaveRef.current(cid, s);
+    }
+    document.addEventListener("keydown", onKey);
+    return () => document.removeEventListener("keydown", onKey);
+  }, []);
+
   const breadcrumb = (
     <div className="flex items-center gap-1.5 text-[12px] text-muted min-w-0">
       <span className="text-acc-ink font-semibold truncate">{conn.name}</span>
@@ -227,7 +253,7 @@ function QueryWorkspaceImpl({
   const canRun = !running && !!sql.trim() && conn.id !== null;
 
   return (
-    <div className="flex flex-col h-full bg-bg overflow-hidden">
+    <div ref={containerRef} className="flex flex-col h-full bg-bg overflow-hidden">
       <div className="flex items-center h-9 px-3 gap-3 bg-bg border-b border-border shrink-0">
         {breadcrumb}
         <div className="flex-1" />

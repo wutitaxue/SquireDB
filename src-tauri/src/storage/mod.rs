@@ -11,6 +11,7 @@ pub mod embedding_models;
 pub mod history;
 pub mod mcp_settings;
 pub mod project;
+pub mod project_cache;
 pub mod relation;
 pub mod repair;
 pub mod saved_query;
@@ -326,6 +327,40 @@ async fn init_schema(pool: &SqlitePool) -> Result<(), sqlx::Error> {
     )
     .execute(pool)
     .await?;
+
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS project_cache_mappings (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            project_id INTEGER NOT NULL,
+            mysql_connection_id INTEGER NOT NULL,
+            mysql_database TEXT NOT NULL,
+            mysql_table TEXT NOT NULL,
+            redis_connection_id INTEGER NOT NULL,
+            key_pattern TEXT NOT NULL,
+            command TEXT NOT NULL,
+            label TEXT,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        )
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_project_cache_mappings_proj \
+         ON project_cache_mappings(project_id, mysql_connection_id, mysql_database, mysql_table)",
+    )
+    .execute(pool)
+    .await?;
+
+    // Idempotent add — pre-existing mappings default to db 0, which matches
+    // the historical "everything on db 0" behaviour before the column existed.
+    let _ = sqlx::query(
+        "ALTER TABLE project_cache_mappings ADD COLUMN redis_db INTEGER NOT NULL DEFAULT 0",
+    )
+    .execute(pool)
+    .await;
 
     sqlx::query(
         r#"

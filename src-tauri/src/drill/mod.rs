@@ -1,11 +1,13 @@
 use std::collections::HashMap;
 use std::time::Instant;
 
+use redis::aio::ConnectionManager;
 use serde::Serialize;
 use sqlx::{MySqlPool, SqlitePool};
 
+use crate::cache::{self, CacheValue};
 use crate::query;
-use crate::storage::project;
+use crate::storage::{project, project_cache};
 
 const DRILL_LIMIT: i64 = 100;
 
@@ -41,11 +43,16 @@ pub struct DrillResult {
     pub primary: Option<serde_json::Map<String, serde_json::Value>>,
     pub primary_elapsed_ms: u64,
     pub related: Vec<DrillNode>,
+    /// Redis cache lookups for the primary row only. Empty when no mapping
+    /// targets this table or when no Redis pool is currently open for the
+    /// configured `redis_connection_id`.
+    pub cache_results: Vec<CacheValue>,
     pub total_elapsed_ms: u64,
 }
 
 pub async fn drill(
     pools: &HashMap<i64, MySqlPool>,
+    redis_mgrs: &HashMap<i64, ConnectionManager>,
     sqlite: &SqlitePool,
     project_id: i64,
     lookup_connection_id: i64,
@@ -76,7 +83,44 @@ pub async fn drill(
     let primary_elapsed_ms = primary_start.elapsed().as_millis() as u64;
 
     let mut related = Vec::new();
+    let mut cache_results: Vec<CacheValue> = Vec::new();
     if let Some(primary_obj) = primary.as_ref() {
+        // Cache mappings — only fired against the primary row (by design,
+        // to keep Redis QPS bounded regardless of drill graph width).
+        let mappings =
+            project_cache::list_for_table(sqlite, project_id, lookup_connection_id, db, table)
+                .await
+                .map_err(|e| format!("list project cache mappings failed: {e}"))?;
+        for m in mappings {
+            match redis_mgrs.get(&m.redis_connection_id) {
+                Some(mgr) => {
+                    cache_results.push(cache::fetch_one(mgr, &m, primary_obj).await);
+                }
+                None => {
+                    // Surface so the UI can hint "open redis conn N" without
+                    // failing the whole drill.
+                    cache_results.push(CacheValue {
+                        mapping_id: m.id,
+                        label: m.label.clone(),
+                        command: m.command.clone(),
+                        key: m.key_pattern.clone(),
+                        ttl_seconds: None,
+                        exists: false,
+                        truncated: false,
+                        string_value: None,
+                        hash_value: None,
+                        list_value: None,
+                        set_value: None,
+                        zset_value: None,
+                        error: Some(format!(
+                            "Redis connection {} is not open",
+                            m.redis_connection_id
+                        )),
+                    });
+                }
+            }
+        }
+
         let relations = project::list_relations(sqlite, project_id)
             .await
             .map_err(|e| format!("list project relations failed: {e}"))?;
@@ -142,6 +186,7 @@ pub async fn drill(
         primary,
         primary_elapsed_ms,
         related,
+        cache_results,
         total_elapsed_ms: total_start.elapsed().as_millis() as u64,
     })
 }

@@ -7,6 +7,7 @@ import type {
   DrillResult,
   Injection,
   Project,
+  ProjectCacheMapping,
   ProjectRelation,
   ProjectTable,
   SavedQuery,
@@ -122,6 +123,7 @@ export function ProjectShell({
 }: Props) {
   const [tables, setTables] = useState<ProjectTable[]>([]);
   const [relations, setRelations] = useState<ProjectRelation[]>([]);
+  const [cacheMappings, setCacheMappings] = useState<ProjectCacheMapping[]>([]);
   const [openConnIds, setOpenConnIds] = useState<Set<number>>(new Set());
   const [unlockingAll, setUnlockingAll] = useState(false);
   const [savedQueries, setSavedQueries] = useState<SavedQuery[]>([]);
@@ -164,12 +166,16 @@ export function ProjectShell({
 
   async function refreshTables(projectId: number) {
     try {
-      const [tableList, relList] = await Promise.all([
+      const [tableList, relList, cacheList] = await Promise.all([
         invoke<ProjectTable[]>("list_project_tables", { projectId }),
         invoke<ProjectRelation[]>("list_project_relations", { projectId }),
+        invoke<ProjectCacheMapping[]>("list_project_cache_mappings", {
+          projectId,
+        }).catch(() => [] as ProjectCacheMapping[]),
       ]);
       setTables(tableList);
       setRelations(relList);
+      setCacheMappings(cacheList);
       setLookupTable((prev) => {
         if (prev) {
           const match = tableList.find(
@@ -224,8 +230,12 @@ export function ProjectShell({
       s.add(r.from_connection_id);
       s.add(r.to_connection_id);
     }
+    for (const m of cacheMappings) {
+      s.add(m.mysql_connection_id);
+      s.add(m.redis_connection_id);
+    }
     return s;
-  }, [tables, relations]);
+  }, [tables, relations, cacheMappings]);
 
   const requiredConnIdsArr = useMemo(
     () => Array.from(requiredConnIds).sort((a, b) => a - b),

@@ -1044,6 +1044,53 @@ export type DrillNode = {
   missing_connection: boolean;
 };
 
+export type CacheCommand = "GET" | "HGETALL" | "LRANGE" | "SMEMBERS" | "ZRANGE";
+
+export const CACHE_COMMANDS: CacheCommand[] = [
+  "GET",
+  "HGETALL",
+  "LRANGE",
+  "SMEMBERS",
+  "ZRANGE",
+];
+
+export type ZsetEntry = {
+  member: string;
+  score: number;
+};
+
+export type CacheValue = {
+  mapping_id: number;
+  label: string | null;
+  command: string;
+  key: string;
+  /** Redis TTL semantics: -1 = no expiry, -2 = no key, ≥0 seconds, null = not fetched. */
+  ttl_seconds: number | null;
+  exists: boolean;
+  truncated: boolean;
+  string_value: string | null;
+  hash_value: Record<string, string> | null;
+  list_value: string[] | null;
+  set_value: string[] | null;
+  zset_value: ZsetEntry[] | null;
+  error: string | null;
+};
+
+export type ProjectCacheMapping = {
+  id: number;
+  project_id: number;
+  mysql_connection_id: number;
+  mysql_database: string;
+  mysql_table: string;
+  redis_connection_id: number;
+  /** Redis logical DB index (0..15). */
+  redis_db: number;
+  key_pattern: string;
+  command: string;
+  label: string | null;
+  created_at: string;
+};
+
 export type DrillResult = {
   connection_id: number;
   db: string;
@@ -1053,6 +1100,7 @@ export type DrillResult = {
   primary: Record<string, unknown> | null;
   primary_elapsed_ms: number;
   related: DrillNode[];
+  cache_results: CacheValue[];
   total_elapsed_ms: number;
 };
 

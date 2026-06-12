@@ -1031,19 +1031,29 @@ function App() {
     if (!p.id) return;
     // Auto-open all required connections for this project (best effort).
     try {
-      const [tableList, relList] = await Promise.all([
+      const [tableList, relList, cacheList] = await Promise.all([
         invoke<{ connection_id: number }[]>("list_project_tables", {
           projectId: p.id,
         }),
         invoke<
           { from_connection_id: number; to_connection_id: number }[]
         >("list_project_relations", { projectId: p.id }),
+        invoke<
+          { mysql_connection_id: number; redis_connection_id: number }[]
+        >("list_project_cache_mappings", { projectId: p.id }).catch(
+          () =>
+            [] as { mysql_connection_id: number; redis_connection_id: number }[],
+        ),
       ]);
       const needed = new Set<number>();
       tableList.forEach((t) => needed.add(t.connection_id));
       relList.forEach((r) => {
         needed.add(r.from_connection_id);
         needed.add(r.to_connection_id);
+      });
+      cacheList.forEach((m) => {
+        needed.add(m.mysql_connection_id);
+        needed.add(m.redis_connection_id);
       });
       const openIds = await invoke<number[]>("list_open_connection_ids");
       const openSet = new Set(openIds);
@@ -1159,13 +1169,13 @@ function App() {
   }
 
   function defaultSavedQueryName(sql: string): string {
-    const firstLine = sql
+    const noBlock = sql.replace(/\/\*[\s\S]*?\*\//g, " ");
+    const firstMeaningful = noBlock
       .split("\n")
-      .find((l) => l.trim().length > 0)
-      ?.trim()
-      .replace(/\s+/g, " ")
-      .slice(0, 50);
-    return firstLine ?? "";
+      .map((l) => l.replace(/--.*$/, "").trim())
+      .find((l) => l.length > 0);
+    if (!firstMeaningful) return "";
+    return firstMeaningful.replace(/\s+/g, " ").slice(0, 50);
   }
 
   function onSavedQuerySaved(q: SavedQuery) {

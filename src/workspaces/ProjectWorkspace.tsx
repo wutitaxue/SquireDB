@@ -4,6 +4,7 @@ import type {
   ProjectTable,
 } from "../types";
 import { isImeComposing } from "../utils";
+import { DrillCacheCard } from "../panels/drill/DrillCacheCard";
 import { DrillPrimaryCard } from "../panels/drill/DrillPrimaryCard";
 import { DrillSection } from "../panels/drill/DrillSection";
 import { Card, ErrorPre, PrimaryButton } from "../shell/AgentPanel";
@@ -143,6 +144,9 @@ export function ProjectWorkspace({
         {result && (
           <>
             <DrillPrimaryCard result={result} />
+            {result.cache_results.map((cv) => (
+              <DrillCacheCard key={cv.mapping_id} value={cv} />
+            ))}
             {result.related.length === 0 ? (
               <Card>
                 <div className="text-[13px] text-muted text-center py-3">

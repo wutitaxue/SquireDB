@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import {
   CARDINALITIES,
@@ -9,6 +9,7 @@ import {
   type ProjectRelation,
   type ProjectTable,
 } from "../types";
+import { ProjectCacheMappingsSection } from "./ProjectCacheMappingsSection";
 
 export function ProjectEditorModal({
   project,
@@ -39,12 +40,16 @@ export function ProjectEditorModal({
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState("");
 
-  // No "owning" connection any more — picker defaults to first known conn.
-  const [addConnId, setAddConnId] = useState<number>(connections[0]?.id ?? 0);
+  // No "owning" connection any more — picker defaults to first table-bearing conn.
+  // Redis / Milvus have no notion of "browse databases/tables" so they're excluded.
+  const [addConnId, setAddConnId] = useState<number>(
+    connections.find((c) => c.kind === "mysql" || c.kind === "sqlite")?.id ?? 0,
+  );
   const [addDb, setAddDb] = useState(defaultDb ?? "");
   const [addDbs, setAddDbs] = useState<string[]>([]);
   const [loadingDbs, setLoadingDbs] = useState(false);
   const [openingConn, setOpeningConn] = useState(false);
+  const [pickerError, setPickerError] = useState("");
 
   const [addDbTables, setAddDbTables] = useState<string[]>([]);
   const [loadingTables, setLoadingTables] = useState(false);
@@ -120,40 +125,67 @@ export function ProjectEditorModal({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [current.id]);
 
+  // Once project tables load, re-point the picker default to a connection / db
+  // that the project actually uses — picking BMS when the project lives on
+  // Siis is confusing and triggers spurious "Connection not open" errors.
+  const alignedToProjectRef = useRef(false);
+  useEffect(() => {
+    if (alignedToProjectRef.current) return;
+    if (tables.length === 0) return;
+    const first = tables[0];
+    alignedToProjectRef.current = true;
+    setAddConnId(first.connection_id);
+    setAddDb(first.database_name);
+  }, [tables]);
+
   // Load DBs whenever the selected connection changes.
+  // Only loads when the conn is already open — closed conns require explicit click on "Open".
   useEffect(() => {
     let cancelled = false;
+    setPickerError("");
     if (!addConnId) {
       setAddDbs([]);
       return;
     }
+    if (!openConnIds.has(addConnId)) {
+      setAddDbs([]);
+      return;
+    }
     setLoadingDbs(true);
-    setOpeningConn(!openConnIds.has(addConnId));
     (async () => {
       try {
         const all = await getDatabases(addConnId);
         if (cancelled) return;
         const filtered = showSystemDbs ? all : all.filter((d) => !SYSTEM_DBS.has(d));
         setAddDbs(filtered);
-        // Pick a sensible default DB for this connection
         if (!filtered.includes(addDb)) {
           setAddDb(filtered[0] ?? "");
         }
-        await refreshOpenConns();
       } catch (e) {
-        if (!cancelled) setError(`Open connection failed: ${e}`);
+        if (!cancelled) setPickerError(String(e));
       } finally {
-        if (!cancelled) {
-          setLoadingDbs(false);
-          setOpeningConn(false);
-        }
+        if (!cancelled) setLoadingDbs(false);
       }
     })();
     return () => {
       cancelled = true;
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [addConnId, showSystemDbs]);
+  }, [addConnId, showSystemDbs, openConnIds]);
+
+  async function openPickerConn() {
+    if (!addConnId) return;
+    setOpeningConn(true);
+    setPickerError("");
+    try {
+      await getDatabases(addConnId);
+      await refreshOpenConns();
+    } catch (e) {
+      setPickerError(String(e));
+    } finally {
+      setOpeningConn(false);
+    }
+  }
 
   // Load tables whenever (conn, db) changes.
   useEffect(() => {
@@ -480,7 +512,7 @@ export function ProjectEditorModal({
       onClick={onClose}
     >
       <div
-        className="bg-panel border border-border rounded-lg w-[720px] max-w-[94vw] max-h-[88vh] flex flex-col"
+        className="bg-panel border border-border rounded-lg w-[1040px] max-w-[94vw] max-h-[88vh] flex flex-col"
         style={{ boxShadow: "var(--sh-3)" }}
         onClick={(e) => e.stopPropagation()}
       >
@@ -535,8 +567,32 @@ export function ProjectEditorModal({
             <>
               <SectionDivider title="Tables in this project" />
 
-              <div className="border border-border rounded-md overflow-hidden bg-panel">
-                <div className="flex items-center gap-1.5 px-2 h-9 border-b border-border bg-panel-2">
+              {tables.length > 0 && (
+                <ProjectTablesList
+                  tables={tables}
+                  openConnIds={openConnIds}
+                  connLabel={connLabel}
+                  onSetPrimary={(id) => void setPrimary(id)}
+                  onRemove={(id) => void removeTable(id)}
+                  onJumpToPicker={(connId, db) => {
+                    setAddConnId(connId);
+                    setAddDb(db);
+                  }}
+                />
+              )}
+
+              <div className="flex items-center gap-2 pt-1">
+                <div className="text-[10px] uppercase tracking-wider font-bold text-muted">
+                  Add tables
+                </div>
+                <div className="text-[10.5px] text-subtle">
+                  Pick any connection / database below — including connections this
+                  project hasn't used yet.
+                </div>
+              </div>
+
+              <div className="border border-border rounded-md overflow-hidden bg-panel shrink-0">
+                <div className="flex items-center gap-1.5 px-2 h-9 border-b border-border bg-panel-2 shrink-0">
                   <select
                     value={addConnId}
                     onChange={(e) => {
@@ -546,17 +602,19 @@ export function ProjectEditorModal({
                     className="h-7 px-2 text-[12px] font-mono bg-panel border border-border rounded outline-none focus:border-acc hover:border-acc cursor-pointer"
                     title="Connection"
                   >
-                    {connections.map((c) => {
-                      if (c.id == null) return null;
-                      const open = openConnIds.has(c.id);
-                      return (
-                        <option key={c.id} value={c.id}>
-                          {open ? "● " : "○ "}
-                          {c.name}
-                          {!open ? " (closed)" : ""}
-                        </option>
-                      );
-                    })}
+                    {connections
+                      .filter((c) => c.kind === "mysql" || c.kind === "sqlite")
+                      .map((c) => {
+                        if (c.id == null) return null;
+                        const open = openConnIds.has(c.id);
+                        return (
+                          <option key={c.id} value={c.id}>
+                            {open ? "● " : "○ "}
+                            {c.name}
+                            {!open ? " (closed)" : ""}
+                          </option>
+                        );
+                      })}
                   </select>
                   <span className="text-[11px] text-subtle">/</span>
                   <select
@@ -567,7 +625,7 @@ export function ProjectEditorModal({
                     title="Database"
                   >
                     {loadingDbs ? (
-                      <option>{openingConn ? "Opening…" : "Loading…"}</option>
+                      <option>Loading…</option>
                     ) : addDbs.length === 0 ? (
                       <option value="">(no databases)</option>
                     ) : (
@@ -601,9 +659,35 @@ export function ProjectEditorModal({
                         : `Add ${pendingTables.size}`}
                   </button>
                 </div>
-                {loadingTables ? (
+                {addConnId && !openConnIds.has(addConnId) ? (
+                  <div className="px-3 py-4 text-[11.5px] text-muted text-center flex flex-col items-center gap-2">
+                    <span>
+                      Connection{" "}
+                      <span className="font-mono text-ink-2">
+                        {connections.find((c) => c.id === addConnId)?.name ?? `#${addConnId}`}
+                      </span>{" "}
+                      is closed — open it to browse tables.
+                    </span>
+                    <button
+                      onClick={() => void openPickerConn()}
+                      disabled={openingConn}
+                      className="h-6 px-3 text-[11px] font-semibold text-white bg-acc rounded hover:bg-acc-2 disabled:opacity-50"
+                    >
+                      {openingConn ? "Opening…" : "Open connection"}
+                    </button>
+                    {pickerError && (
+                      <div className="text-[11px] text-crit bg-crit-soft px-2 py-1 rounded max-w-full break-words">
+                        {pickerError}
+                      </div>
+                    )}
+                  </div>
+                ) : loadingTables ? (
                   <div className="px-3 py-6 text-[11.5px] text-muted text-center">
                     Loading tables…
+                  </div>
+                ) : pickerError ? (
+                  <div className="px-3 py-3 text-[11px] text-crit bg-crit-soft text-center break-words">
+                    {pickerError}
                   </div>
                 ) : addDbTables.length === 0 ? (
                   <div className="px-3 py-6 text-[11.5px] text-muted text-center">
@@ -728,8 +812,8 @@ export function ProjectEditorModal({
               )}
 
               <div className="bg-acc-soft/30 border border-acc/20 rounded-md p-3 flex flex-col gap-2">
-                <div className="flex items-center gap-2 flex-wrap">
-                  <span className="text-[11px] uppercase tracking-wider font-semibold text-acc-ink">
+                <div className="flex items-center gap-2">
+                  <span className="text-[11px] uppercase tracking-wider font-semibold text-acc-ink w-10 shrink-0">
                     From
                   </span>
                   <select
@@ -743,7 +827,7 @@ export function ProjectEditorModal({
                         column: "",
                       });
                     }}
-                    className="h-7 px-2 text-[12px] font-mono bg-panel border border-border rounded-md outline-none focus:border-acc"
+                    className="h-7 px-2 text-[12px] font-mono bg-panel border border-border rounded-md outline-none focus:border-acc flex-1 min-w-0"
                   >
                     <option value="0||">(pick)</option>
                     {tables.map((t) => (
@@ -762,7 +846,7 @@ export function ProjectEditorModal({
                     value={relFrom.column}
                     onChange={(e) => setRelFrom({ ...relFrom, column: e.target.value })}
                     disabled={fromColumns.length === 0}
-                    className="h-7 px-2 text-[12px] font-mono bg-panel border border-border rounded-md outline-none focus:border-acc disabled:opacity-50"
+                    className="h-7 px-2 text-[12px] font-mono bg-panel border border-border rounded-md outline-none focus:border-acc disabled:opacity-50 w-[200px] shrink-0"
                   >
                     {fromColumns.map((c) => (
                       <option key={c} value={c}>
@@ -770,8 +854,9 @@ export function ProjectEditorModal({
                       </option>
                     ))}
                   </select>
-                  <span className="text-[12px] text-muted">→</span>
-                  <span className="text-[11px] uppercase tracking-wider font-semibold text-acc-ink">
+                </div>
+                <div className="flex items-center gap-2">
+                  <span className="text-[11px] uppercase tracking-wider font-semibold text-acc-ink w-10 shrink-0">
                     To
                   </span>
                   <select
@@ -785,7 +870,7 @@ export function ProjectEditorModal({
                         column: "",
                       });
                     }}
-                    className="h-7 px-2 text-[12px] font-mono bg-panel border border-border rounded-md outline-none focus:border-acc"
+                    className="h-7 px-2 text-[12px] font-mono bg-panel border border-border rounded-md outline-none focus:border-acc flex-1 min-w-0"
                   >
                     <option value="0||">(pick)</option>
                     {tables.map((t) => (
@@ -804,7 +889,7 @@ export function ProjectEditorModal({
                     value={relTo.column}
                     onChange={(e) => setRelTo({ ...relTo, column: e.target.value })}
                     disabled={toColumns.length === 0}
-                    className="h-7 px-2 text-[12px] font-mono bg-panel border border-border rounded-md outline-none focus:border-acc disabled:opacity-50"
+                    className="h-7 px-2 text-[12px] font-mono bg-panel border border-border rounded-md outline-none focus:border-acc disabled:opacity-50 w-[200px] shrink-0"
                   >
                     {toColumns.map((c) => (
                       <option key={c} value={c}>
@@ -812,10 +897,15 @@ export function ProjectEditorModal({
                       </option>
                     ))}
                   </select>
+                </div>
+                <div className="flex items-center gap-2">
+                  <span className="text-[11px] uppercase tracking-wider font-semibold text-acc-ink w-10 shrink-0">
+                    Card
+                  </span>
                   <select
                     value={relCard}
                     onChange={(e) => setRelCard(e.target.value)}
-                    className="h-7 px-2 text-[12px] font-mono bg-panel border border-border rounded-md outline-none focus:border-acc"
+                    className="h-7 px-2 text-[12px] font-mono bg-panel border border-border rounded-md outline-none focus:border-acc w-[120px] shrink-0"
                   >
                     {CARDINALITIES.map((c) => (
                       <option key={c} value={c}>
@@ -823,11 +913,12 @@ export function ProjectEditorModal({
                       </option>
                     ))}
                   </select>
+                  <div className="flex-1" />
                   <button
                     onClick={() => void addRelation()}
-                    className="h-7 px-3 text-[11px] font-semibold text-white bg-acc rounded-md hover:bg-acc-2"
+                    className="h-7 px-4 text-[11px] font-semibold text-white bg-acc rounded-md hover:bg-acc-2"
                   >
-                    Add
+                    Add relation
                   </button>
                 </div>
               </div>
@@ -841,7 +932,7 @@ export function ProjectEditorModal({
                 <div className="border border-border rounded-md overflow-hidden">
                   <div
                     className="grid bg-bg-2 px-3 h-7 items-center gap-3 border-b border-border text-[10px] uppercase tracking-wider font-bold text-muted"
-                    style={{ gridTemplateColumns: "1fr 1fr 60px 80px 60px" }}
+                    style={{ gridTemplateColumns: "minmax(0,1fr) minmax(0,1fr) 60px 80px 60px" }}
                   >
                     <div>From</div>
                     <div>To</div>
@@ -857,9 +948,9 @@ export function ProjectEditorModal({
                       <div
                         key={r.id}
                         className="grid px-3 h-8 items-center gap-3 border-b border-border last:border-b-0 text-[11px] hover:bg-[rgba(0,109,104,0.03)]"
-                        style={{ gridTemplateColumns: "1fr 1fr 60px 80px 60px" }}
+                        style={{ gridTemplateColumns: "minmax(0,1fr) minmax(0,1fr) 60px 80px 60px" }}
                       >
-                        <code className="font-mono text-ink-2 overflow-hidden text-ellipsis whitespace-nowrap">
+                        <code className="font-mono text-ink-2 overflow-hidden text-ellipsis whitespace-nowrap min-w-0 block">
                           {r.from_connection_id !== primaryConnId && (
                             <span className="text-[9px] mr-1 px-1 bg-acc-soft text-acc-ink rounded font-sans font-bold">
                               {connLabel(r.from_connection_id)}
@@ -883,7 +974,7 @@ export function ProjectEditorModal({
                             </span>
                           )}
                         </code>
-                        <code className="font-mono text-ink-2 overflow-hidden text-ellipsis whitespace-nowrap">
+                        <code className="font-mono text-ink-2 overflow-hidden text-ellipsis whitespace-nowrap min-w-0 block">
                           {r.to_connection_id !== primaryConnId && (
                             <span className="text-[9px] mr-1 px-1 bg-acc-soft text-acc-ink rounded font-sans font-bold">
                               {connLabel(r.to_connection_id)}
@@ -908,6 +999,14 @@ export function ProjectEditorModal({
                   })}
                   </div>
                 </div>
+              )}
+
+              {current.id != null && (
+                <ProjectCacheMappingsSection
+                  projectId={current.id}
+                  tables={tables}
+                  connections={connections}
+                />
               )}
             </>
           )}
@@ -997,6 +1096,140 @@ function SectionDivider({
       </div>
       <div className="flex-1" />
       {actions}
+    </div>
+  );
+}
+
+function ProjectTablesList({
+  tables,
+  openConnIds,
+  connLabel,
+  onSetPrimary,
+  onRemove,
+  onJumpToPicker,
+}: {
+  tables: ProjectTable[];
+  openConnIds: Set<number>;
+  connLabel: (id: number) => string;
+  onSetPrimary: (id: number) => void;
+  onRemove: (id: number) => void;
+  onJumpToPicker: (connId: number, db: string) => void;
+}) {
+  const [expanded, setExpanded] = useState(true);
+  type Group = { connId: number; db: string; rows: ProjectTable[] };
+  const groups: Group[] = [];
+  for (const t of tables) {
+    let g = groups.find(
+      (x) => x.connId === t.connection_id && x.db === t.database_name,
+    );
+    if (!g) {
+      g = { connId: t.connection_id, db: t.database_name, rows: [] };
+      groups.push(g);
+    }
+    g.rows.push(t);
+  }
+  for (const g of groups) {
+    g.rows.sort((a, b) => a.table_name.localeCompare(b.table_name));
+  }
+
+  return (
+    <div className="border border-border rounded-md bg-panel shrink-0">
+      <button
+        type="button"
+        onClick={() => setExpanded((x) => !x)}
+        className="w-full flex items-center gap-2 px-3 h-7 border-b border-border bg-bg-2 hover:bg-panel-2 text-left"
+      >
+        <span className="text-[10px] text-muted inline-block">
+          {expanded ? "▼" : "▶"}
+        </span>
+        <span className="text-[10px] uppercase tracking-wider font-bold text-muted">
+          Already in project
+        </span>
+        <span className="text-[10.5px] text-subtle">
+          {tables.length} table{tables.length !== 1 ? "s" : ""}
+        </span>
+        <div className="flex-1" />
+        <span className="text-[10px] text-subtle">
+          {expanded ? "click to collapse" : "click to expand"}
+        </span>
+      </button>
+      {expanded && <div className="max-h-[180px] overflow-auto">
+        {groups.map((g) => {
+          const open = openConnIds.has(g.connId);
+          return (
+            <div key={`${g.connId}|${g.db}`} className="border-b border-border last:border-b-0">
+              <button
+                type="button"
+                onClick={() => onJumpToPicker(g.connId, g.db)}
+                className="w-full flex items-center gap-2 px-3 h-6 bg-panel-2 hover:bg-bg-2 text-left"
+                title="Jump to this database in the picker below"
+              >
+                <span className={`text-[10px] ${open ? "text-ok" : "text-muted"}`}>
+                  {open ? "●" : "○"}
+                </span>
+                <span className="text-[11px] font-mono text-ink-2 truncate">
+                  {connLabel(g.connId)} <span className="text-subtle">/</span> {g.db}
+                </span>
+                {!open && (
+                  <span className="text-[9px] px-1 bg-warn-soft text-warn rounded font-sans font-bold">
+                    CLOSED
+                  </span>
+                )}
+                <div className="flex-1" />
+                <span className="text-[10px] text-subtle">{g.rows.length}</span>
+              </button>
+              <div
+                className="p-1"
+                style={{
+                  display: "grid",
+                  gridTemplateColumns: "repeat(auto-fill, minmax(240px, 1fr))",
+                  gap: 1,
+                }}
+              >
+                {g.rows.map((t) => {
+                  const isPrimary = t.is_primary === 1;
+                  return (
+                    <div
+                      key={t.id}
+                      className="row flex items-center gap-1.5 px-2 h-6 text-[11.5px] font-mono rounded hover:bg-bg-2"
+                    >
+                      <span className="truncate flex-1 text-ink-2" title={t.table_name}>
+                        {t.table_name}
+                        {isPrimary && (
+                          <span
+                            className="ml-1 text-acc font-sans"
+                            title="Primary table"
+                          >
+                            ★
+                          </span>
+                        )}
+                      </span>
+                      {!isPrimary && (
+                        <button
+                          type="button"
+                          onClick={() => onSetPrimary(t.id)}
+                          className="text-[9px] uppercase tracking-wide text-acc hover:underline shrink-0"
+                          title="Set as primary table"
+                        >
+                          ★
+                        </button>
+                      )}
+                      <button
+                        type="button"
+                        onClick={() => onRemove(t.id)}
+                        className="text-[10px] text-crit hover:underline shrink-0"
+                        title="Remove from project"
+                      >
+                        ×
+                      </button>
+                    </div>
+                  );
+                })}
+              </div>
+            </div>
+          );
+        })}
+      </div>}
     </div>
   );
 }
