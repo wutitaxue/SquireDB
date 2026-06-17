@@ -24,6 +24,15 @@ export function applyOrderBy(
   return `${head.trimEnd()}\n${orderBy}${tail.rest ? "\n" + tail.rest : ""}`;
 }
 
+/** Strip any top-level ORDER BY clause, preserving LIMIT / OFFSET / FOR UPDATE
+ *  / LOCK IN SHARE MODE. Same regex-best-effort approach as applyOrderBy. */
+export function clearOrderBy(sql: string): string {
+  const trimmed = sql.replace(/;\s*$/, "");
+  const tail = extractTailClauses(trimmed);
+  const head = trimmed.slice(0, tail.start);
+  return `${head.trimEnd()}${tail.rest ? "\n" + tail.rest : ""}`;
+}
+
 function backtick(name: string): string {
   return `\`${name.replace(/`/g, "``")}\``;
 }

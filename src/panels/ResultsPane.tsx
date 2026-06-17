@@ -1,4 +1,5 @@
-import { memo, useEffect, useMemo, useRef, useState } from "react";
+import { forwardRef, memo, useEffect, useMemo, useRef, useState } from "react";
+import { createPortal } from "react-dom";
 import { useVirtualizer } from "@tanstack/react-virtual";
 import { invoke } from "@tauri-apps/api/core";
 import { save as saveDialog } from "@tauri-apps/plugin-dialog";
@@ -55,6 +56,9 @@ type Props = {
    * Milvus / Redis where the result isn't backed by a single SQL).
    */
   onSort?: (columnName: string, dir: "asc" | "desc") => void;
+  /** Strip any injected ORDER BY and rerun. Powers the third state of the
+   * header sort tri-state (none → asc → desc → none). */
+  onClearSort?: () => void;
   /** Currently-injected sort, used to render the ▲/▼ indicator. */
   sort?: { column: string; dir: "asc" | "desc" } | null;
 };
@@ -80,6 +84,21 @@ function inferColumnTypes(result: QueryResult): boolean[] {
     }
     return total > 0 && n / total >= 0.8;
   });
+}
+
+/** Canonical key for a cell value used by the IDEA-style filter popover and
+ *  visibility check. NULL and undefined collapse to the same `__null__` token. */
+function cellKey(v: unknown): string {
+  if (v === null || v === undefined) return "__null__";
+  if (typeof v === "object") return JSON.stringify(v);
+  return String(v);
+}
+
+/** Human display for the filter popover. NULL renders as `(null)`. */
+function cellDisplay(v: unknown): string {
+  if (v === null || v === undefined) return "(null)";
+  if (typeof v === "object") return JSON.stringify(v);
+  return String(v);
 }
 
 function pkSignature(row: unknown[], pkIndices: number[]): string {
@@ -113,6 +132,7 @@ function ResultsPaneImpl(props: Props) {
     rowLimitNotice,
     availableViews = DEFAULT_VIEWS,
     onSort,
+    onClearSort,
     sort,
   } = props;
 
@@ -663,6 +683,7 @@ function ResultsPaneImpl(props: Props) {
           onRecordEdit={recordEdit}
           onRevertEdit={revertEdit}
           onSort={onSort}
+          onClearSort={onClearSort}
           sort={sort ?? null}
         />
       ) : (
@@ -769,6 +790,7 @@ function TableView({
   onRecordEdit,
   onRevertEdit,
   onSort,
+  onClearSort,
   sort,
 }: {
   result: QueryResult;
@@ -783,17 +805,54 @@ function TableView({
   onRecordEdit: (rowIdx: number, colIdx: number, value: unknown) => void;
   onRevertEdit: (rowIdx: number, colIdx: number) => void;
   onSort?: (columnName: string, dir: "asc" | "desc") => void;
+  onClearSort?: () => void;
   sort: { column: string; dir: "asc" | "desc" } | null;
 }) {
   const [editing, setEditing] = useState<{ row: number; col: number } | null>(null);
   const [draft, setDraft] = useState("");
   const inputRef = useRef<HTMLInputElement | null>(null);
   const [viewer, setViewer] = useState<{ row: number; col: number } | null>(null);
+  const [activeCol, setActiveCol] = useState<number | null>(null);
+  // Filter is a whitelist of cell value keys per column. Empty set = no filter
+  // (show all). Key is the same stringified form used in the popover list, so
+  // membership check is O(1).
+  const [filters, setFilters] = useState<Record<number, Set<string>>>({});
+  const [openFilter, setOpenFilter] = useState<{
+    col: number;
+    anchorRight: number;
+    anchorBottom: number;
+  } | null>(null);
+  const filterPopRef = useRef<HTMLDivElement | null>(null);
 
-  function onHeaderClick(columnName: string) {
+  useEffect(() => {
+    setFilters({});
+    setActiveCol(null);
+    setOpenFilter(null);
+  }, [result]);
+
+  useEffect(() => {
+    if (openFilter == null) return;
+    function onDocPointer(e: PointerEvent) {
+      if (!filterPopRef.current) return;
+      if (!filterPopRef.current.contains(e.target as Node)) setOpenFilter(null);
+    }
+    function onKey(e: KeyboardEvent) {
+      if (e.key === "Escape") setOpenFilter(null);
+    }
+    document.addEventListener("pointerdown", onDocPointer);
+    document.addEventListener("keydown", onKey);
+    return () => {
+      document.removeEventListener("pointerdown", onDocPointer);
+      document.removeEventListener("keydown", onKey);
+    };
+  }, [openFilter]);
+
+  function cycleSort(columnName: string) {
     if (!onSort) return;
     const current = sort?.column === columnName ? sort.dir : null;
-    onSort(columnName, current === "asc" ? "desc" : "asc");
+    if (current == null) onSort(columnName, "asc");
+    else if (current === "asc") onSort(columnName, "desc");
+    else onClearSort?.();
   }
 
   useEffect(() => {
@@ -853,6 +912,32 @@ function TableView({
     );
   }
 
+  // Local view filter: per-column whitelist of cell value keys (IDEA "Local
+  // Filter" model). Empty set = no filter on that column. Applies to rendered
+  // rows only; result.rows is untouched so selection sigs / pendingEdits keys
+  // keep referencing original indices.
+  const visibleRows = useMemo(() => {
+    const active = Object.entries(filters)
+      .map(([k, set]) => [Number(k), set] as const)
+      .filter(([, set]) => set.size > 0);
+    if (active.length === 0) {
+      return result.rows.map((row, originalIdx) => ({ row, originalIdx }));
+    }
+    const out: Array<{ row: unknown[]; originalIdx: number }> = [];
+    for (let i = 0; i < result.rows.length; i++) {
+      const row = result.rows[i];
+      let match = true;
+      for (const [col, allowed] of active) {
+        if (!allowed.has(cellKey(row[col]))) {
+          match = false;
+          break;
+        }
+      }
+      if (match) out.push({ row, originalIdx: i });
+    }
+    return out;
+  }, [result.rows, filters]);
+
   const allSelected = editable && selected.size === result.rows.length;
 
   // CSS Grid is the single source of truth for column widths — header and
@@ -879,7 +964,7 @@ function TableView({
 
   const scrollRef = useRef<HTMLDivElement | null>(null);
   const rowVirtualizer = useVirtualizer({
-    count: result.rows.length,
+    count: visibleRows.length,
     getScrollElement: () => scrollRef.current,
     estimateSize: () => ROW_H,
     overscan: 8,
@@ -932,24 +1017,16 @@ function TableView({
           {result.columns.map((c, j) => {
             const sorted = sort?.column === c.name ? sort.dir : null;
             const sortable = !!onSort;
+            const filterSet = filters[j];
+            const hasFilter = !!filterSet && filterSet.size > 0;
+            const isActive = activeCol === j;
             return (
               <div
                 key={c.name}
-                onClick={sortable ? () => onHeaderClick(c.name) : undefined}
-                title={
-                  !sortable
-                    ? undefined
-                    : sorted === "asc"
-                      ? "Sorted ascending — click for descending"
-                      : sorted === "desc"
-                        ? "Sorted descending — click for ascending"
-                        : "Click to sort ascending (rewrites SQL)"
-                }
-                className={`flex items-center px-3 text-[11px] font-semibold text-ink-2 whitespace-nowrap overflow-hidden border-r border-border/40 select-none ${
-                  sortable ? "cursor-pointer hover:bg-bg" : ""
-                } ${numericMask[j] ? "justify-end" : "justify-start"} ${
-                  sorted ? "bg-acc-soft/40" : ""
-                }`}
+                onClick={() => setActiveCol(j)}
+                className={`flex items-center px-2 text-[11px] font-semibold text-ink-2 whitespace-nowrap overflow-hidden border-r border-border/40 select-none cursor-pointer ${
+                  numericMask[j] ? "justify-end" : "justify-start"
+                } ${isActive ? "bg-acc-soft/60" : sorted ? "bg-acc-soft/40" : ""}`}
               >
                 <span className="truncate">
                   {pkSet.has(j) && <span className="text-acc mr-1" title="Primary key">🔑</span>}
@@ -958,11 +1035,77 @@ function TableView({
                 <span className="text-subtle font-mono font-normal ml-1.5 text-[10px] shrink-0">
                   {c.type_name}
                 </span>
-                {sorted && (
-                  <span className="ml-1 text-[10px] shrink-0 text-acc">
-                    {sorted === "asc" ? "▲" : "▼"}
-                  </span>
+                <span className="flex-1" />
+                {sortable && (
+                  <button
+                    type="button"
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      cycleSort(c.name);
+                    }}
+                    title={
+                      sorted === "asc"
+                        ? "Sorted ascending — click for descending"
+                        : sorted === "desc"
+                          ? "Sorted descending — click to clear"
+                          : "Click to sort ascending (rewrites SQL)"
+                    }
+                    className={`shrink-0 w-5 h-5 flex items-center justify-center rounded hover:bg-bg ${
+                      sorted ? "text-acc" : "text-subtle hover:text-ink-2"
+                    }`}
+                  >
+                    <svg
+                      width="8"
+                      height="10"
+                      viewBox="0 0 8 10"
+                      fill="currentColor"
+                      stroke="none"
+                    >
+                      {sorted === "asc" ? (
+                        <path d="M4 1 L7.2 6 H0.8 Z" />
+                      ) : sorted === "desc" ? (
+                        <path d="M4 9 L0.8 4 H7.2 Z" />
+                      ) : (
+                        <>
+                          <path d="M4 0.6 L7 4 H1 Z" opacity="0.55" />
+                          <path d="M4 9.4 L1 6 H7 Z" opacity="0.55" />
+                        </>
+                      )}
+                    </svg>
+                  </button>
                 )}
+                <button
+                  type="button"
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    if (openFilter?.col === j) {
+                      setOpenFilter(null);
+                    } else {
+                      const rect = (e.currentTarget as HTMLElement).getBoundingClientRect();
+                      setOpenFilter({
+                        col: j,
+                        anchorRight: rect.right,
+                        anchorBottom: rect.bottom,
+                      });
+                    }
+                  }}
+                  title={hasFilter ? `Filter: ${filterSet!.size} value(s) selected` : "Filter this column"}
+                  className={`w-5 h-5 flex items-center justify-center rounded hover:bg-bg shrink-0 ${
+                    hasFilter ? "text-acc" : "text-subtle hover:text-ink-2"
+                  }`}
+                >
+                  <svg
+                    width="10"
+                    height="10"
+                    viewBox="0 0 10 10"
+                    fill={hasFilter ? "currentColor" : "none"}
+                    stroke="currentColor"
+                    strokeWidth="1.1"
+                    strokeLinejoin="round"
+                  >
+                    <path d="M1 1.5 H9 L6 5.2 V8.5 L4 9.2 V5.2 Z" />
+                  </svg>
+                </button>
               </div>
             );
           })}
@@ -979,14 +1122,14 @@ function TableView({
           }}
         >
         {rowVirtualizer.getVirtualItems().map((virtual) => {
-          const i = virtual.index;
-          const row = result.rows[i];
+          const visIdx = virtual.index;
+          const { row, originalIdx } = visibleRows[visIdx];
           const sig = editable ? pkSignature(row, pkIndices) : "";
           const isSelected = editable && selected.has(sig);
           return (
             <div
-              key={i}
-              data-row-index={i}
+              key={originalIdx}
+              data-row-index={originalIdx}
               className={`border-b border-border ${
                 isSelected ? "bg-acc-soft/30" : "hover:bg-[rgba(0,109,104,0.04)]"
               }`}
@@ -1011,15 +1154,16 @@ function TableView({
                 </div>
               )}
               <div className="flex items-center justify-end px-2 text-[11px] text-subtle font-mono tabular-nums select-none border-r border-border/30">
-                {i + 1}
+                {visIdx + 1}
               </div>
               {row.map((cell, j) => {
-                const pending = pendingEdits.get(`${i}-${j}`);
+                const pending = pendingEdits.get(`${originalIdx}-${j}`);
                 const displayCell = pending ? pending.value : cell;
                 const rendered = renderCell(displayCell);
                 const isStringCol = !numericMask[j];
-                const isEditing = editing?.row === i && editing.col === j;
+                const isEditing = editing?.row === originalIdx && editing.col === j;
                 const isDirty = !!pending;
+                const isActiveColCell = activeCol === j;
 
                 if (isEditing) {
                   return (
@@ -1049,11 +1193,12 @@ function TableView({
                 return (
                   <div
                     key={j}
+                    onClick={() => setActiveCol(j)}
                     onDoubleClick={() => {
                       if (worthy) {
-                        setViewer({ row: i, col: j });
+                        setViewer({ row: originalIdx, col: j });
                       } else if (editable) {
-                        startEdit(i, j);
+                        startEdit(originalIdx, j);
                       }
                     }}
                     className={`relative group flex items-center px-3 font-mono whitespace-nowrap text-[12px] overflow-hidden border-r border-border/30 ${
@@ -1061,7 +1206,11 @@ function TableView({
                     } ${
                       displayCell === null ? "text-subtle italic" : "text-ink-2"
                     } ${editable || worthy ? "cursor-text" : ""} ${
-                      isDirty ? "bg-warn-soft/60 ring-1 ring-warn/40 ring-inset" : ""
+                      isDirty
+                        ? "bg-warn-soft/60 ring-1 ring-warn/40 ring-inset"
+                        : isActiveColCell
+                          ? "bg-acc-soft/25"
+                          : ""
                     }`}
                     title={
                       isDirty
@@ -1085,7 +1234,7 @@ function TableView({
                         type="button"
                         onClick={(e) => {
                           e.stopPropagation();
-                          setViewer({ row: i, col: j });
+                          setViewer({ row: originalIdx, col: j });
                         }}
                         className="absolute right-1 top-1/2 -translate-y-1/2 opacity-0 group-hover:opacity-100 transition w-5 h-5 flex items-center justify-center text-[11px] text-muted hover:text-ink bg-panel/90 border border-border rounded shadow-1"
                         title="Open in viewer"
@@ -1102,9 +1251,11 @@ function TableView({
         </div>
       </div>
 
-      {totalRows > result.rows.length && (
+      {(totalRows > result.rows.length || visibleRows.length < result.rows.length) && (
         <div className="px-4 py-2 text-[11px] text-muted italic text-center border-t border-border">
-          Showing {result.rows.length} of {totalRows} rows
+          {visibleRows.length < result.rows.length
+            ? `Showing ${visibleRows.length} of ${result.rows.length} rows (filtered${totalRows > result.rows.length ? `, ${totalRows} server-side` : ""})`
+            : `Showing ${result.rows.length} of ${totalRows} rows`}
         </div>
       )}
     </div>
@@ -1125,9 +1276,235 @@ function TableView({
           onClose={() => setViewer(null)}
         />
       )}
+      {openFilter &&
+        createPortal(
+          <FilterPopover
+            ref={filterPopRef}
+            anchorRight={openFilter.anchorRight}
+            anchorBottom={openFilter.anchorBottom}
+            columnName={result.columns[openFilter.col].name}
+            rows={result.rows}
+            colIdx={openFilter.col}
+            selected={filters[openFilter.col] ?? null}
+            onChange={(next) =>
+              setFilters((prev) => {
+                const copy = { ...prev };
+                // null = "no filter" (back to unfiltered state, Clear button).
+                // An empty Set is a legitimate "nothing selected" state — it
+                // hides every row and must persist so the user can re-tick
+                // values; collapsing it to null would resurrect implicit
+                // all-selected and the unchecking would appear to do nothing.
+                if (next === null) delete copy[openFilter.col];
+                else copy[openFilter.col] = next;
+                return copy;
+              })
+            }
+            onClose={() => setOpenFilter(null)}
+          />,
+          document.body,
+        )}
     </div>
   );
 }
+
+const FILTER_DISTINCT_CAP = 500;
+
+type FilterPopoverProps = {
+  columnName: string;
+  rows: unknown[][];
+  colIdx: number;
+  selected: Set<string> | null;
+  onChange: (next: Set<string> | null) => void;
+  onClose: () => void;
+  anchorRight: number;
+  anchorBottom: number;
+};
+
+const FilterPopover = forwardRef<HTMLDivElement, FilterPopoverProps>(
+  function FilterPopover(
+    { columnName, rows, colIdx, selected, onChange, onClose, anchorRight, anchorBottom },
+    ref,
+  ) {
+    const [search, setSearch] = useState("");
+
+    // Per-column distinct values + frequencies. Capped at FILTER_DISTINCT_CAP;
+    // beyond that the popover degrades to a notice (filtering still works on
+    // whatever's already selected, the picker just won't enumerate everything).
+    const { values, truncated } = useMemo(() => {
+      const counts = new Map<string, { display: string; count: number }>();
+      let truncatedFlag = false;
+      for (const row of rows) {
+        const v = row[colIdx];
+        const key = cellKey(v);
+        const existing = counts.get(key);
+        if (existing) {
+          existing.count += 1;
+        } else {
+          if (counts.size >= FILTER_DISTINCT_CAP) {
+            truncatedFlag = true;
+            continue;
+          }
+          counts.set(key, { display: cellDisplay(v), count: 1 });
+        }
+      }
+      const arr = Array.from(counts.entries()).map(([key, v]) => ({
+        key,
+        display: v.display,
+        count: v.count,
+      }));
+      arr.sort((a, b) => b.count - a.count || a.display.localeCompare(b.display));
+      return { values: arr, truncated: truncatedFlag };
+    }, [rows, colIdx]);
+
+    const filtered = useMemo(() => {
+      const q = search.trim().toLowerCase();
+      if (!q) return values;
+      return values.filter((v) => v.display.toLowerCase().includes(q));
+    }, [values, search]);
+
+    // null = "everything checked" implicitly (no filter). Once the user
+    // unticks anything we materialize into an explicit Set.
+    const checked = selected;
+
+    function isChecked(key: string): boolean {
+      return checked === null ? true : checked.has(key);
+    }
+
+    function toggle(key: string) {
+      const current = checked === null ? new Set(values.map((v) => v.key)) : new Set(checked);
+      if (current.has(key)) current.delete(key);
+      else current.add(key);
+      // Materialize as a Set even if it would equal "all" — explicit state.
+      // visibleRows treats size===0 as "match nothing" which is correct here.
+      onChange(current);
+    }
+
+    const allVisibleChecked = filtered.every((v) => isChecked(v.key));
+    function toggleAllVisible() {
+      const current = checked === null ? new Set(values.map((v) => v.key)) : new Set(checked);
+      if (allVisibleChecked) {
+        for (const v of filtered) current.delete(v.key);
+      } else {
+        for (const v of filtered) current.add(v.key);
+      }
+      onChange(current);
+    }
+
+    const W = 280;
+    const H = 360;
+    const PAD = 8;
+    const vw = typeof window !== "undefined" ? window.innerWidth : 1280;
+    const vh = typeof window !== "undefined" ? window.innerHeight : 800;
+    const left = Math.max(PAD, Math.min(anchorRight - W, vw - W - PAD));
+    const top = Math.min(anchorBottom + 2, vh - H - PAD);
+    return (
+      <div
+        ref={ref}
+        onClick={(e) => e.stopPropagation()}
+        className="fixed z-50 bg-panel border border-border rounded-md shadow-3 overflow-hidden flex flex-col"
+        style={{ left, top, width: W, maxHeight: H }}
+      >
+        <div className="px-3 py-2 border-b border-border text-[11px] text-ink-2 shrink-0">
+          Local Filter For{" "}
+          <span className="font-mono text-acc-ink">'{columnName}'</span>
+        </div>
+
+        <div className="p-2 border-b border-border shrink-0">
+          <div className="relative">
+            <span className="absolute left-2 top-1/2 -translate-y-1/2 text-subtle text-[11px]">
+              🔍
+            </span>
+            <input
+              autoFocus
+              type="text"
+              value={search}
+              onChange={(e) => setSearch(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === "Escape") {
+                  e.preventDefault();
+                  onClose();
+                }
+              }}
+              placeholder="Search…"
+              className="w-full h-7 pl-7 pr-2 text-[12px] bg-panel-2 border border-border rounded outline-none focus:border-acc"
+            />
+          </div>
+        </div>
+
+        <div className="grid grid-cols-[20px_1fr_auto] items-center gap-2 px-3 h-7 text-[10px] uppercase tracking-wider font-bold text-muted border-b border-border shrink-0">
+          <input
+            type="checkbox"
+            checked={filtered.length > 0 && allVisibleChecked}
+            onChange={toggleAllVisible}
+            disabled={filtered.length === 0}
+            className="cursor-pointer"
+            title="Toggle all visible"
+          />
+          <span>Value</span>
+          <span className="text-right">Count</span>
+        </div>
+
+        <div className="flex-1 min-h-0 overflow-auto">
+          {truncated && (
+            <div className="px-3 py-2 text-[11px] text-warn bg-warn-soft/40 border-b border-border">
+              Too many distinct values — showing first {FILTER_DISTINCT_CAP}.
+            </div>
+          )}
+          {filtered.length === 0 ? (
+            <div className="px-3 py-3 text-[11px] text-muted italic text-center">
+              No matches.
+            </div>
+          ) : (
+            filtered.map((v) => {
+              const isNull = v.key === "__null__";
+              return (
+                <label
+                  key={v.key}
+                  className="grid grid-cols-[20px_1fr_auto] items-center gap-2 px-3 h-6 text-[12px] cursor-pointer hover:bg-bg-2"
+                >
+                  <input
+                    type="checkbox"
+                    checked={isChecked(v.key)}
+                    onChange={() => toggle(v.key)}
+                    className="cursor-pointer"
+                  />
+                  <span
+                    className={`font-mono truncate ${isNull ? "italic text-subtle" : "text-ink-2"}`}
+                    title={v.display}
+                  >
+                    {v.display}
+                  </span>
+                  <span className="text-right font-mono tabular-nums text-muted text-[11px]">
+                    {v.count}
+                  </span>
+                </label>
+              );
+            })
+          )}
+        </div>
+
+        <div className="flex items-center gap-2 px-2 py-2 border-t border-border shrink-0">
+          <button
+            onClick={() => {
+              onChange(null);
+              onClose();
+            }}
+            className="h-6 px-2 text-[11px] text-ink-2 bg-bg border border-border rounded hover:bg-bg-2"
+          >
+            Clear
+          </button>
+          <div className="flex-1" />
+          <button
+            onClick={onClose}
+            className="h-6 px-2.5 text-[11px] font-semibold text-white bg-acc rounded hover:bg-acc-2"
+          >
+            Done
+          </button>
+        </div>
+      </div>
+    );
+  },
+);
 
 function InsertRowDialog({
   connectionId,

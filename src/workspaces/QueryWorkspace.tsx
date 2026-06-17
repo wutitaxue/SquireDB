@@ -13,7 +13,7 @@ import type { ReactCodeMirrorRef } from "@uiw/react-codemirror";
 import { AiStrip } from "../panels/AiStrip";
 import { ResultsPane } from "../panels/ResultsPane";
 import { useStableCallback } from "../hooks/useStableCallback";
-import { applyOrderBy } from "../sqlSort";
+import { applyOrderBy, clearOrderBy } from "../sqlSort";
 import { splitSqlStatements } from "../splitSql";
 
 /**
@@ -287,6 +287,12 @@ function QueryWorkspaceImpl({
     const next = applyOrderBy(sql, column, dir);
     setSql(next);
     setSortHint({ column, dir });
+    void run(next);
+  });
+  const stableClearSort = useStableCallback(() => {
+    const next = clearOrderBy(sql);
+    setSql(next);
+    setSortHint(null);
     void run(next);
   });
   // Manual edits to the SQL invalidate the sort indicator — the column may
@@ -568,6 +574,7 @@ function QueryWorkspaceImpl({
           explainError={explainError}
           onAskExplain={stableAskExplain}
           onSort={stableSort}
+          onClearSort={stableClearSort}
           sort={sortHint}
         />
       ) : (
