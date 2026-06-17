@@ -49,6 +49,14 @@ type Props = {
   rowLimitNotice?: string;
   /** Subset of view tabs to expose. Defaults to all four. */
   availableViews?: ViewKind[];
+  /**
+   * If provided, column headers become clickable to inject ORDER BY into the
+   * source SQL and rerun. Without this, headers are non-interactive (e.g. for
+   * Milvus / Redis where the result isn't backed by a single SQL).
+   */
+  onSort?: (columnName: string, dir: "asc" | "desc") => void;
+  /** Currently-injected sort, used to render the ▲/▼ indicator. */
+  sort?: { column: string; dir: "asc" | "desc" } | null;
 };
 
 const DEFAULT_VIEWS: ViewKind[] = ["table", "chart", "json", "plan"];
@@ -104,6 +112,8 @@ function ResultsPaneImpl(props: Props) {
     onAskExplain,
     rowLimitNotice,
     availableViews = DEFAULT_VIEWS,
+    onSort,
+    sort,
   } = props;
 
   const [view, setView] = useState<ViewKind>("table");
@@ -652,6 +662,8 @@ function ResultsPaneImpl(props: Props) {
           pendingEdits={pendingEdits}
           onRecordEdit={recordEdit}
           onRevertEdit={revertEdit}
+          onSort={onSort}
+          sort={sort ?? null}
         />
       ) : (
         <div className="flex-1 min-h-0 overflow-auto">
@@ -756,6 +768,8 @@ function TableView({
   pendingEdits,
   onRecordEdit,
   onRevertEdit,
+  onSort,
+  sort,
 }: {
   result: QueryResult;
   numericMask: boolean[];
@@ -768,11 +782,19 @@ function TableView({
   pendingEdits: Map<string, { rowIdx: number; colIdx: number; value: unknown }>;
   onRecordEdit: (rowIdx: number, colIdx: number, value: unknown) => void;
   onRevertEdit: (rowIdx: number, colIdx: number) => void;
+  onSort?: (columnName: string, dir: "asc" | "desc") => void;
+  sort: { column: string; dir: "asc" | "desc" } | null;
 }) {
   const [editing, setEditing] = useState<{ row: number; col: number } | null>(null);
   const [draft, setDraft] = useState("");
   const inputRef = useRef<HTMLInputElement | null>(null);
   const [viewer, setViewer] = useState<{ row: number; col: number } | null>(null);
+
+  function onHeaderClick(columnName: string) {
+    if (!onSort) return;
+    const current = sort?.column === columnName ? sort.dir : null;
+    onSort(columnName, current === "asc" ? "desc" : "asc");
+  }
 
   useEffect(() => {
     if (editing && inputRef.current) {
@@ -907,22 +929,43 @@ function TableView({
           <div className="flex items-center justify-end px-2 text-[11px] font-semibold text-muted border-r border-border/40 select-none">
             #
           </div>
-          {result.columns.map((c, j) => (
-            <div
-              key={c.name}
-              className={`flex items-center px-3 text-[11px] font-semibold text-ink-2 whitespace-nowrap overflow-hidden border-r border-border/40 ${
-                numericMask[j] ? "justify-end" : "justify-start"
-              }`}
-            >
-              <span className="truncate">
-                {pkSet.has(j) && <span className="text-acc mr-1" title="Primary key">🔑</span>}
-                {c.name}
-              </span>
-              <span className="text-subtle font-mono font-normal ml-1.5 text-[10px] shrink-0">
-                {c.type_name}
-              </span>
-            </div>
-          ))}
+          {result.columns.map((c, j) => {
+            const sorted = sort?.column === c.name ? sort.dir : null;
+            const sortable = !!onSort;
+            return (
+              <div
+                key={c.name}
+                onClick={sortable ? () => onHeaderClick(c.name) : undefined}
+                title={
+                  !sortable
+                    ? undefined
+                    : sorted === "asc"
+                      ? "Sorted ascending — click for descending"
+                      : sorted === "desc"
+                        ? "Sorted descending — click for ascending"
+                        : "Click to sort ascending (rewrites SQL)"
+                }
+                className={`flex items-center px-3 text-[11px] font-semibold text-ink-2 whitespace-nowrap overflow-hidden border-r border-border/40 select-none ${
+                  sortable ? "cursor-pointer hover:bg-bg" : ""
+                } ${numericMask[j] ? "justify-end" : "justify-start"} ${
+                  sorted ? "bg-acc-soft/40" : ""
+                }`}
+              >
+                <span className="truncate">
+                  {pkSet.has(j) && <span className="text-acc mr-1" title="Primary key">🔑</span>}
+                  {c.name}
+                </span>
+                <span className="text-subtle font-mono font-normal ml-1.5 text-[10px] shrink-0">
+                  {c.type_name}
+                </span>
+                {sorted && (
+                  <span className="ml-1 text-[10px] shrink-0 text-acc">
+                    {sorted === "asc" ? "▲" : "▼"}
+                  </span>
+                )}
+              </div>
+            );
+          })}
         </div>
 
         {/* Virtualized body — only rows inside the viewport (plus overscan)
