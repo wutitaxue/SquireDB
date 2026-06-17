@@ -16,6 +16,11 @@ export type QueryTab = {
   kind: "query";
   name: string;
   connectionId: number;
+  /** Per-tab database picker. When set, the backend opens a single-use
+   *  connection scoped to this database for each query. When undefined,
+   *  the query runs on the shared pool with whatever default db the
+   *  connection was opened with. */
+  database?: string;
 };
 export type AgentTab = { id: string; kind: "agent"; agent: AgentId; name: string };
 export type ProjectDrillTab = {

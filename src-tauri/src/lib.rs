@@ -46,7 +46,7 @@ struct AppState {
     active_sqlite: Mutex<HashMap<i64, SqlitePool>>,
     active_redis: Mutex<HashMap<i64, redis::aio::ConnectionManager>>,
     // query_token -> (connection_id, mysql_thread_id) for in-flight queries
-    running_queries: Mutex<HashMap<String, (i64, u64)>>,
+    running_queries: Arc<Mutex<HashMap<String, (i64, u64)>>>,
     // Shared with the MCP server task so allowlist edits take effect live
     // without restarting Squire. Empty Vec means "allow all".
     mcp_allowed_conns: Arc<RwLock<Vec<i64>>>,
@@ -449,12 +449,48 @@ async fn milvus_query(
         .await
 }
 
+/// Wraps `query::execute_with_database` with cancel-token bookkeeping.
+async fn run_with_database(
+    host: String,
+    port: u16,
+    username: String,
+    password: String,
+    db: String,
+    sql: String,
+    conn_id: i64,
+    query_token: Option<String>,
+    running_queries: std::sync::Arc<
+        tokio::sync::Mutex<std::collections::HashMap<String, (i64, u64)>>,
+    >,
+) -> Result<query::QueryResult, sqlx::Error> {
+    let (tid_tx, tid_rx) = tokio::sync::oneshot::channel::<u64>();
+    let register_token = query_token.clone();
+    let register_running = running_queries.clone();
+    // Register the thread_id for cancellation as soon as we learn it.
+    tokio::spawn(async move {
+        if let Ok(thread_id) = tid_rx.await {
+            if let Some(token) = register_token {
+                register_running
+                    .lock()
+                    .await
+                    .insert(token, (conn_id, thread_id));
+            }
+        }
+    });
+    let r = query::execute_with_database(host, port, username, password, db, sql, tid_tx).await;
+    if let Some(token) = query_token.as_ref() {
+        running_queries.lock().await.remove(token);
+    }
+    r
+}
+
 #[tauri::command]
 async fn execute_query(
     state: State<'_, AppState>,
     id: i64,
     sql: String,
     query_token: Option<String>,
+    database: Option<String>,
 ) -> Result<QueryResult, String> {
     if is_sqlite(&state, id).await {
         let pool = get_sqlite_pool(&state, id).await?;
@@ -496,7 +532,39 @@ async fn execute_query(
         .cloned()
         .ok_or_else(|| "Connection not open. Click 'Open' first.".to_string())?;
 
-    let result = if let Some(token) = query_token.as_ref() {
+    // When the caller picks a database for this query, we acquire a conn,
+    // run `USE` on it via the text protocol (raw_sql), then run the user SQL.
+    // The conn is then **detached** from the pool so the per-conn `USE`
+    // side-effect doesn't leak to a future borrower. Without a database the
+    // existing pool path is unchanged.
+    let db_choice = database
+        .as_ref()
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string());
+
+    let result = if let Some(db) = db_choice.clone() {
+        // Per-tab database picker: open a single-use connection scoped to
+        // `db`. Cheap relative to the query itself but adds a handshake
+        // round-trip per query; that's the price of not having to manage
+        // `USE` session-state leakage in the shared pool.
+        let creds = storage::connection::get_by_id(&state.sqlite, id)
+            .await
+            .map_err(|e| format!("connection lookup failed: {e}"))?;
+        let password = crypto::get_password(&state.sqlite, id).await?;
+        run_with_database(
+            creds.host,
+            creds.port as u16,
+            creds.username,
+            password,
+            db,
+            sql.clone(),
+            id,
+            query_token.clone(),
+            state.running_queries.clone(),
+        )
+        .await
+    } else if let Some(token) = query_token.as_ref() {
         let acquired = query::acquire_with_thread_id(&pool).await;
         match acquired {
             Ok((mut conn, thread_id)) => {
@@ -4591,7 +4659,7 @@ pub fn run() {
                 active_milvus: Mutex::new(HashMap::new()),
                 active_sqlite: Mutex::new(HashMap::new()),
                 active_redis: Mutex::new(HashMap::new()),
-                running_queries: Mutex::new(HashMap::new()),
+                running_queries: Arc::new(Mutex::new(HashMap::new())),
                 mcp_allowed_conns,
             });
             Ok(())

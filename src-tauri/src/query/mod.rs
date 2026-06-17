@@ -65,6 +65,40 @@ pub async fn acquire_with_thread_id(
     Ok((conn, thread_id))
 }
 
+/// Switch the current schema for an open connection via `USE`. Uses the
+/// text protocol (`raw_sql`) — `USE` isn't supported by MySQL's prepared
+/// statement protocol that sqlx defaults to.
+///
+/// The caller should make sure the conn is single-use (e.g. `.detach()`-ed
+/// from the pool) so the per-conn schema change doesn't leak to the next
+/// borrower.
+/// Open a throw-away single-connection pool pointed at `db`, run `sql` on
+/// it, return the result. Used by the per-tab database picker: we avoid
+/// touching the long-lived pool's session state (no `USE` needed — the
+/// database is supplied in the MySQL handshake, which accepts it without
+/// the prepared-statement limitations that affect server-side `USE`).
+///
+/// `thread_id_tx` receives the MySQL `CONNECTION_ID()` of the throwaway
+/// conn so the caller can register it for cancellation.
+pub async fn execute_with_database(
+    host: String,
+    port: u16,
+    username: String,
+    password: String,
+    db: String,
+    sql: String,
+    thread_id_tx: tokio::sync::oneshot::Sender<u64>,
+) -> Result<QueryResult, sqlx::Error> {
+    let scoped = build_pool(&host, port, &username, &password, Some(&db)).await?;
+    let (mut conn, thread_id) = acquire_with_thread_id(&scoped).await?;
+    let _ = thread_id_tx.send(thread_id);
+    let r = execute_on_conn(&mut conn, &sql).await;
+    // Pool is dropped here; the single conn is closed with it.
+    drop(conn);
+    scoped.close().await;
+    r
+}
+
 /// Run a SQL statement on an already-acquired connection. Used by
 /// cancellable execute path; the caller must hold the connection so that
 /// `KILL QUERY <thread_id>` from another connection targets it.

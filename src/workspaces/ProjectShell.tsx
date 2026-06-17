@@ -607,6 +607,9 @@ export function ProjectShell({
             onAiInject={() => {}}
             onExecuted={onExecuted}
             onRequestSaveQuery={onRequestSaveQuery}
+            databases={[]}
+            database={undefined}
+            onChangeDatabase={() => {}}
           />
         ) : activeTab?.kind === "table-designer" ? (
           <TableDesignerWorkspace

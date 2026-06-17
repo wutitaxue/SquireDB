@@ -1,11 +1,16 @@
 import type { Tab } from "./types";
 import { AGENT_META, PROJECT_AGENT_META } from "./types";
+import { useContextMenu, type ContextMenuItem } from "./atoms/ContextMenu";
 
 type Props = {
   tabs: Tab[];
   activeTabId: string | null;
   onSelectTab: (id: string) => void;
   onCloseTab: (id: string) => void;
+  onCloseOthers?: (id: string) => void;
+  onCloseToRight?: (id: string) => void;
+  onCloseAll?: () => void;
+  onDuplicate?: (id: string) => void;
   onNewQueryTab?: () => void;
 };
 
@@ -26,9 +31,66 @@ export function Tabbar({
   activeTabId,
   onSelectTab,
   onCloseTab,
+  onCloseOthers,
+  onCloseToRight,
+  onCloseAll,
+  onDuplicate,
   onNewQueryTab,
 }: Props) {
+  const ctx = useContextMenu();
+
   if (tabs.length === 0 && !onNewQueryTab) return null;
+
+  function openMenu(e: React.MouseEvent, tab: Tab) {
+    e.preventDefault();
+    const idx = tabs.findIndex((t) => t.id === tab.id);
+    const hasOthers = tabs.length > 1;
+    const hasRight = idx >= 0 && idx < tabs.length - 1;
+    // Duplicate makes sense only for tabs that re-derive their state from an
+    // injection (SQL editor tabs). Agent / drill / designer tabs are tied to
+    // a single id and a duplicate wouldn't carry their internal state.
+    const canDuplicate = tab.kind === "query" && !!onDuplicate;
+
+    const items: ContextMenuItem[] = [
+      {
+        kind: "action",
+        label: "Close",
+        icon: "×",
+        shortcut: "⌘W",
+        onClick: () => onCloseTab(tab.id),
+      },
+      {
+        kind: "action",
+        label: "Close others",
+        onClick: () => onCloseOthers?.(tab.id),
+        disabled: !hasOthers || !onCloseOthers,
+      },
+      {
+        kind: "action",
+        label: "Close to the right",
+        onClick: () => onCloseToRight?.(tab.id),
+        disabled: !hasRight || !onCloseToRight,
+      },
+      {
+        kind: "action",
+        label: "Close all",
+        onClick: () => onCloseAll?.(),
+        disabled: !onCloseAll,
+        danger: true,
+      },
+    ];
+    if (canDuplicate) {
+      items.push({ kind: "separator" });
+      items.push({
+        kind: "action",
+        label: "Duplicate",
+        icon: "⎘",
+        onClick: () => onDuplicate?.(tab.id),
+      });
+    }
+    ctx.open(e, items);
+  }
+
   return (
     <div className="flex items-stretch h-[34px] bg-bg-2 border-b border-border shrink-0 overflow-x-auto">
       {tabs.map((tab) => {
@@ -40,6 +102,14 @@ export function Tabbar({
               active ? "bg-bg" : "hover:bg-bg/60"
             }`}
             onClick={() => onSelectTab(tab.id)}
+            onContextMenu={(e) => openMenu(e, tab)}
+            onAuxClick={(e) => {
+              // Middle-click closes the tab — standard browser convention.
+              if (e.button === 1) {
+                e.preventDefault();
+                onCloseTab(tab.id);
+              }
+            }}
           >
             {active && (
               <span className="absolute top-0 left-0 right-0 h-[2px] bg-acc" />
@@ -75,6 +145,7 @@ export function Tabbar({
         </button>
       )}
       <div className="flex-1" />
+      {ctx.element}
     </div>
   );
 }

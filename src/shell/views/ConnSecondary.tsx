@@ -1,4 +1,3 @@
-import { formatTime } from "../../utils";
 import type { HistoryEntry, QuerySuggestion, SavedQuery } from "../../types";
 import { Section } from "../atoms/Section";
 import { SavedQueriesSection } from "../atoms/SavedQueriesSection";
@@ -147,50 +146,9 @@ export function ConnSecondary(props: Props) {
         queries={savedQueries}
         onOpen={onOpenSavedQuery}
         onContextMenu={onSavedQueryContextMenu}
+        history={history}
+        onUseHistory={onUseHistory}
       />
-
-      {history.length > 0 && (
-        <div className="flex-1 min-h-0 overflow-y-auto">
-        <Section
-          title="History"
-          actions={
-            <span className="text-[10px] text-subtle">last {history.length}</span>
-          }
-          bordered={false}
-          flush
-        >
-          <ul>
-            {history.map((h) => {
-              const truncated = h.sql.replace(/\s+/g, " ").slice(0, 60);
-              const more = h.sql.length > 60 ? "…" : "";
-              const ok = h.error === null;
-              const meta = ok
-                ? `${h.rows_returned ?? h.rows_affected ?? 0}r · ${h.elapsed_ms ?? "?"}ms`
-                : "error";
-              return (
-                <li key={h.id}>
-                  <button
-                    onClick={() => onUseHistory(h.sql)}
-                    title={h.sql}
-                    className="w-full text-left px-2 py-1 hover:bg-bg rounded"
-                  >
-                    <div
-                      className={`text-[11px] font-mono truncate ${ok ? "text-ink-2" : "text-crit"}`}
-                    >
-                      {ok ? "⚡" : "✗"} {truncated}
-                      {more}
-                    </div>
-                    <div className="text-[10px] text-subtle">
-                      {meta} · {formatTime(h.executed_at)}
-                    </div>
-                  </button>
-                </li>
-              );
-            })}
-          </ul>
-        </Section>
-        </div>
-      )}
     </>
   );
 }

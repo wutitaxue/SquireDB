@@ -901,6 +901,15 @@ function App() {
   const stableOnQueryExecuted = useStableCallback((connId: number) => {
     void refreshHistory(connId);
   });
+  const setTabDatabase = useStableCallback(
+    (tabId: string, next: string | undefined) => {
+      setTabs((prev) =>
+        prev.map((t) =>
+          t.id === tabId && t.kind === "query" ? { ...t, database: next } : t,
+        ),
+      );
+    },
+  );
 
   function openAgent(agent: AgentId) {
     if (workingId === null) return;
@@ -1087,6 +1096,61 @@ function App() {
     if (lastFocusedQueryTabId === id) setLastFocusedQueryTabId(null);
   }
 
+  function closeManyTabs(idsToClose: Set<string>, keepActiveId: string | null) {
+    if (idsToClose.size === 0) return;
+    setTabs((prev) => prev.filter((t) => !idsToClose.has(t.id)));
+    setActiveTabId(keepActiveId);
+    setQueryInjections((prev) => {
+      const next = { ...prev };
+      for (const id of idsToClose) delete next[id];
+      return next;
+    });
+    if (lastFocusedQueryTabId && idsToClose.has(lastFocusedQueryTabId)) {
+      setLastFocusedQueryTabId(null);
+    }
+  }
+
+  function closeOtherTabs(keepId: string) {
+    const toClose = new Set(tabs.filter((t) => t.id !== keepId).map((t) => t.id));
+    closeManyTabs(toClose, keepId);
+  }
+
+  function closeTabsToRight(pivotId: string) {
+    const idx = tabs.findIndex((t) => t.id === pivotId);
+    if (idx < 0) return;
+    const toClose = new Set(tabs.slice(idx + 1).map((t) => t.id));
+    const nextActive = toClose.has(activeTabId ?? "") ? pivotId : activeTabId;
+    closeManyTabs(toClose, nextActive);
+  }
+
+  function closeAllTabs() {
+    const toClose = new Set(tabs.map((t) => t.id));
+    closeManyTabs(toClose, null);
+  }
+
+  function duplicateTab(id: string) {
+    const src = tabs.find((t) => t.id === id);
+    if (!src || src.kind !== "query") return;
+    const sourceSql = queryInjections[id]?.sql ?? "";
+    const newId = `query:${Date.now()}`;
+    setTabs((prev) => {
+      const idx = prev.findIndex((t) => t.id === id);
+      const insertAt = idx >= 0 ? idx + 1 : prev.length;
+      const dup: Tab = {
+        id: newId,
+        kind: "query",
+        name: src.name,
+        connectionId: src.connectionId,
+      };
+      return [...prev.slice(0, insertAt), dup, ...prev.slice(insertAt)];
+    });
+    setQueryInjections((inj) => ({
+      ...inj,
+      [newId]: { sql: sourceSql, autorun: false, nonce: Date.now() },
+    }));
+    setActiveTabId(newId);
+  }
+
   function newQueryTab() {
     if (workingId === null) return;
     const id = `query:${Date.now()}`;
@@ -1099,42 +1163,26 @@ function App() {
   }
 
   function openSavedQuery(q: SavedQuery) {
-    // Saved queries are connection-scoped. In Connection mode, just open a new
-    // tab in the active workspace if we're already on that connection;
-    // otherwise switch first.
-    if (mode.kind === "connection" && mode.connectionId === q.connection_id) {
-      const id = `query:${Date.now()}`;
-      setTabsByMode((m) => {
-        const key = workspaceKey(mode);
-        const cur = m[key] ?? { tabs: [], activeTabId: null };
-        const n = cur.tabs.filter((t) => t.kind === "query").length + 1;
-        return {
+    // Saved queries get a stable tab id keyed by (workspace, saved-query-id),
+    // so opening the same saved query twice just re-activates the existing
+    // tab instead of accumulating dupes. The connection-mode branch only
+    // applies when the user is already on the owning connection — otherwise
+    // there's no workspace to open the tab in (we don't auto-switch).
+    if (
+      (mode.kind === "connection" && mode.connectionId === q.connection_id) ||
+      mode.kind === "project"
+    ) {
+      const key = workspaceKey(mode);
+      const id = `saved:${key}:${q.id}`;
+      const existing = (tabsByMode[key]?.tabs ?? []).find((t) => t.id === id);
+      if (existing) {
+        setTabsByMode((m) => ({
           ...m,
-          [key]: {
-            tabs: [
-              ...cur.tabs,
-              {
-                id,
-                kind: "query",
-                name: q.name || `query-${n}.sql`,
-                connectionId: q.connection_id,
-              },
-            ],
-            activeTabId: id,
-          },
-        };
-      });
-      setQueryInjections((inj) => ({
-        ...inj,
-        [id]: { sql: q.sql, autorun: false, nonce: Date.now() },
-      }));
-      return;
-    }
-    // Project mode: open a new tab in the project workspace bound to this conn
-    if (mode.kind === "project") {
-      const id = `query:${Date.now()}`;
+          [key]: { ...(m[key] ?? { tabs: [], activeTabId: null }), activeTabId: id },
+        }));
+        return;
+      }
       setTabsByMode((m) => {
-        const key = workspaceKey(mode);
         const cur = m[key] ?? { tabs: [], activeTabId: null };
         const n = cur.tabs.filter((t) => t.kind === "query").length + 1;
         return {
@@ -1165,7 +1213,19 @@ function App() {
 
   function requestSaveQuery(connectionId: number, sql: string) {
     if (!sql.trim()) return;
-    setSaveModalState({ connectionId, sql, existing: null });
+    // If the active tab originated from a saved query (tab id shape
+    // `saved:{wsKey}:{savedQueryId}`), pre-load that record so the modal
+    // updates the existing entry instead of creating a duplicate. Saving on
+    // a fresh / table-preview tab still creates a new saved query.
+    let existing: SavedQuery | null = null;
+    if (activeTabId) {
+      const m = /^saved:[^:]+(?::[^:]+)*:(\d+)$/.exec(activeTabId);
+      if (m) {
+        const savedId = parseInt(m[1], 10);
+        existing = savedQueries.find((q) => q.id === savedId) ?? null;
+      }
+    }
+    setSaveModalState({ connectionId, sql, existing });
   }
 
   function defaultSavedQueryName(sql: string): string {
@@ -1526,6 +1586,10 @@ function App() {
           activeTabId={activeTabId}
           onSelectTab={setActiveTabId}
           onCloseTab={closeTab}
+          onCloseOthers={closeOtherTabs}
+          onCloseToRight={closeTabsToRight}
+          onCloseAll={closeAllTabs}
+          onDuplicate={duplicateTab}
           onNewQueryTab={
             mode.kind === "connection" && working && working.kind !== "milvus"
               ? newQueryTab
@@ -1700,6 +1764,9 @@ function App() {
                         onAiInject={stableInjectFromAi}
                         onExecuted={stableOnQueryExecuted}
                         onRequestSaveQuery={requestSaveQuery}
+                        databases={databases}
+                        database={tab.database}
+                        onChangeDatabase={(next) => setTabDatabase(tab.id, next)}
                       />
                     </div>
                   ))}
