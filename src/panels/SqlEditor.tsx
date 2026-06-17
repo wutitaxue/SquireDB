@@ -1,14 +1,34 @@
 import { useMemo, useRef } from "react";
-import CodeMirror from "@uiw/react-codemirror";
+import CodeMirror, { type ReactCodeMirrorRef } from "@uiw/react-codemirror";
 import { sql, MySQL } from "@codemirror/lang-sql";
 import { EditorView, keymap } from "@codemirror/view";
 import { HighlightStyle, syntaxHighlighting } from "@codemirror/language";
 import { tags as t } from "@lezer/highlight";
 
+/** Read the currently-selected fragment from a CodeMirror ref. Returns
+ *  `undefined` when there's no selection or the editor isn't mounted —
+ *  callers should fall back to the full document in that case. */
+export function getSelection(ref: React.RefObject<ReactCodeMirrorRef | null>): string | undefined {
+  const view = ref.current?.view;
+  if (!view) return undefined;
+  const { from, to } = view.state.selection.main;
+  if (from === to) return undefined;
+  return view.state.sliceDoc(from, to);
+}
+
 type Props = {
   value: string;
   onChange: (next: string) => void;
-  onRun: () => void;
+  /** Called by ⌘/Ctrl+Enter. When the editor has a non-empty selection, the
+   *  selected text is passed so the caller can run only that fragment. With
+   *  no selection, `selected` is undefined and the caller should fall back to
+   *  the full document. The Run button reads selection separately via the
+   *  editorRef + getSelection helper. */
+  onRun: (selected?: string) => void;
+  /** Optional ref to the underlying CodeMirror instance. Pass when the parent
+   *  needs to read the current selection outside of the Mod-Enter keymap —
+   *  e.g. when clicking a Run button. */
+  editorRef?: React.RefObject<ReactCodeMirrorRef | null>;
   readOnly?: boolean;
   schema?: Record<string, string[]>;
 };
@@ -117,7 +137,7 @@ const editorTheme = EditorView.theme(
   { dark: false },
 );
 
-export function SqlEditor({ value, onChange, onRun, readOnly, schema }: Props) {
+export function SqlEditor({ value, onChange, onRun, editorRef, readOnly, schema }: Props) {
   // onRun identity often changes per keystroke at the callsite (it closes over
   // local state). Holding it in a ref keeps the extensions array stable so
   // CodeMirror doesn't reconfigure the whole editor (recompiling the SQL
@@ -133,8 +153,10 @@ export function SqlEditor({ value, onChange, onRun, readOnly, schema }: Props) {
       keymap.of([
         {
           key: "Mod-Enter",
-          run: () => {
-            onRunRef.current();
+          run: (view) => {
+            const { from, to } = view.state.selection.main;
+            const selected = from !== to ? view.state.sliceDoc(from, to) : undefined;
+            onRunRef.current(selected);
             return true;
           },
         },
@@ -146,6 +168,7 @@ export function SqlEditor({ value, onChange, onRun, readOnly, schema }: Props) {
 
   return (
     <CodeMirror
+      ref={editorRef}
       value={value}
       onChange={onChange}
       extensions={extensions}
