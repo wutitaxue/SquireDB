@@ -84,6 +84,16 @@ function QueryWorkspaceImpl({
   // is only a UI hint and is cleared whenever the user edits the SQL manually.
   const [sortHint, setSortHint] = useState<{ column: string; dir: "asc" | "desc" } | null>(null);
 
+  // Result-pane column visibility lives at the tab level (not inside
+  // ResultsPane) so the preference survives Run wiping the previous batch —
+  // every Run does `setBatch([])` which momentarily unmounts ResultsPane.
+  // Keyed by column name; stale names from old result schemas are harmless.
+  const [hiddenCols, setHiddenCols] = useState<Set<string>>(new Set());
+
+  // Same story for user-dragged column widths. Keyed by column name → px.
+  // Stale entries for columns that no longer exist are harmless.
+  const [columnWidths, setColumnWidths] = useState<Record<string, number>>({});
+
   const [cancelling, setCancelling] = useState(false);
   const runningTokenRef = useRef<string | null>(null);
   const cancellingRef = useRef(false);
@@ -576,6 +586,10 @@ function QueryWorkspaceImpl({
           onSort={stableSort}
           onClearSort={stableClearSort}
           sort={sortHint}
+          hiddenCols={hiddenCols}
+          onHiddenColsChange={setHiddenCols}
+          columnWidths={columnWidths}
+          onColumnWidthsChange={setColumnWidths}
         />
       ) : (
         <div className="flex-1 flex items-center justify-center text-muted text-[12px]">

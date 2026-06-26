@@ -61,6 +61,16 @@ type Props = {
   onClearSort?: () => void;
   /** Currently-injected sort, used to render the ▲/▼ indicator. */
   sort?: { column: string; dir: "asc" | "desc" } | null;
+
+  /** Hidden column names (keyed by name, not index, so the set survives
+   *  Run wiping the batch). Owned by QueryWorkspace per-tab. */
+  hiddenCols?: Set<string>;
+  onHiddenColsChange?: (next: Set<string>) => void;
+
+  /** User-dragged column widths, keyed by column name → px. Same lifetime
+   *  reasoning as hiddenCols. */
+  columnWidths?: Record<string, number>;
+  onColumnWidthsChange?: (next: Record<string, number>) => void;
 };
 
 const DEFAULT_VIEWS: ViewKind[] = ["table", "chart", "json", "plan"];
@@ -166,6 +176,26 @@ function ResultsPaneImpl(props: Props) {
   const [copyOpen, setCopyOpen] = useState(false);
   const exportMenuRef = useRef<HTMLDivElement>(null);
   const copyMenuRef = useRef<HTMLDivElement>(null);
+  // Column visibility is owned by the parent (QueryWorkspace) per-tab so it
+  // survives a Run wiping the previous batch (which momentarily unmounts this
+  // component). Fall back to an empty uncontrolled state if the caller doesn't
+  // pass it — e.g. drill / agent panes that don't need persistence.
+  const [uncontrolledHiddenCols, setUncontrolledHiddenCols] = useState<Set<string>>(new Set());
+  const hiddenCols = props.hiddenCols ?? uncontrolledHiddenCols;
+  const setHiddenCols = (next: Set<string>) => {
+    if (props.onHiddenColsChange) props.onHiddenColsChange(next);
+    else setUncontrolledHiddenCols(next);
+  };
+  // Column widths — same uncontrolled-fallback pattern as hiddenCols.
+  const [uncontrolledColumnWidths, setUncontrolledColumnWidths] = useState<Record<string, number>>({});
+  const columnWidths = props.columnWidths ?? uncontrolledColumnWidths;
+  const setColumnWidths = (next: Record<string, number>) => {
+    if (props.onColumnWidthsChange) props.onColumnWidthsChange(next);
+    else setUncontrolledColumnWidths(next);
+  };
+  const [colsOpen, setColsOpen] = useState(false);
+  const [colsQuery, setColsQuery] = useState("");
+  const colsMenuRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
     if (!copyFlash) return;
@@ -208,6 +238,23 @@ function ResultsPaneImpl(props: Props) {
     };
   }, [copyOpen]);
 
+  useEffect(() => {
+    if (!colsOpen) return;
+    function onDocPointer(e: PointerEvent) {
+      if (!colsMenuRef.current) return;
+      if (!colsMenuRef.current.contains(e.target as Node)) setColsOpen(false);
+    }
+    function onKey(e: KeyboardEvent) {
+      if (e.key === "Escape") setColsOpen(false);
+    }
+    document.addEventListener("pointerdown", onDocPointer);
+    document.addEventListener("keydown", onKey);
+    return () => {
+      document.removeEventListener("pointerdown", onDocPointer);
+      document.removeEventListener("keydown", onKey);
+    };
+  }, [colsOpen]);
+
   async function runExport(fmt: ExportFormat) {
     setExportOpen(false);
     setExportError("");
@@ -238,6 +285,9 @@ function ResultsPaneImpl(props: Props) {
     setMutationError("");
     setMutationStatus("");
     setPendingEdits(new Map());
+    // Note: hiddenCols intentionally NOT reset here — column visibility is a
+    // user preference that persists across re-runs within the same tab. Stale
+    // names from old result schemas are harmless (they just don't match).
   }, [result]);
 
   function selectView(v: ViewKind) {
@@ -540,6 +590,28 @@ function ResultsPaneImpl(props: Props) {
               </span>
             </>
           )}
+          {(() => {
+            // Count only names that exist in current result.columns; stale
+            // names from a prior result schema shouldn't inflate the badge.
+            const effectiveHidden = result.columns.reduce(
+              (n, c) => (hiddenCols.has(c.name) ? n + 1 : n),
+              0,
+            );
+            return (
+              effectiveHidden > 0 && (
+                <>
+                  <span className="text-border-2">·</span>
+                  <button
+                    onClick={() => setHiddenCols(new Set())}
+                    className="text-warn hover:underline"
+                    title="Click to show all columns"
+                  >
+                    {effectiveHidden} column{effectiveHidden > 1 ? "s" : ""} hidden
+                  </button>
+                </>
+              )
+            );
+          })()}
         </span>
 
         <div className="flex-1" />
@@ -624,6 +696,108 @@ function ResultsPaneImpl(props: Props) {
           </>
         )}
 
+        {view === "table" && result.columns.length > 0 && (() => {
+          const visibleCount = result.columns.reduce(
+            (n, c) => (hiddenCols.has(c.name) ? n : n + 1),
+            0,
+          );
+          const someHidden = visibleCount < result.columns.length;
+          return (
+            <div className="relative" ref={colsMenuRef}>
+              <button
+                onClick={() => {
+                  setColsOpen((v) => !v);
+                  setColsQuery("");
+                }}
+                title="Show / hide columns"
+                className={`h-6 px-2 text-[11px] font-medium rounded-md border inline-flex items-center gap-1 whitespace-nowrap shrink-0 ${
+                  someHidden
+                    ? "text-acc bg-acc-soft/40 border-acc/40"
+                    : "text-ink-2 bg-bg border-border hover:bg-bg-2"
+                }`}
+              >
+                Columns
+                {someHidden && (
+                  <span className="tabular-nums">
+                    ({visibleCount}/{result.columns.length})
+                  </span>
+                )}
+                <span className="text-muted text-[9px]">▾</span>
+              </button>
+              {colsOpen && (
+                <div className="absolute right-0 top-7 z-30 w-[280px] max-h-[420px] bg-panel border border-border rounded-md shadow-lg flex flex-col">
+                  <div className="p-2 border-b border-border shrink-0">
+                    <input
+                      autoFocus
+                      type="text"
+                      value={colsQuery}
+                      onChange={(e) => setColsQuery(e.target.value)}
+                      placeholder="Filter columns…"
+                      className="w-full px-2 h-7 text-[11px] bg-bg border border-border rounded outline-none focus:border-acc"
+                    />
+                    <div className="flex items-center gap-1 mt-1.5">
+                      <button
+                        onClick={() => setHiddenCols(new Set())}
+                        className="flex-1 h-6 px-2 text-[10px] text-ink-2 bg-bg border border-border rounded hover:bg-bg-2"
+                      >
+                        Show all
+                      </button>
+                      <button
+                        onClick={() => {
+                          // Leave the first column visible to avoid an empty grid.
+                          const all = new Set<string>();
+                          for (let j = 1; j < result.columns.length; j++) {
+                            all.add(result.columns[j].name);
+                          }
+                          setHiddenCols(all);
+                        }}
+                        className="flex-1 h-6 px-2 text-[10px] text-ink-2 bg-bg border border-border rounded hover:bg-bg-2"
+                        title="Hides all except the first column"
+                      >
+                        Hide all
+                      </button>
+                    </div>
+                  </div>
+                  <div className="flex-1 min-h-0 overflow-y-auto py-1">
+                    {result.columns.map((c, j) => {
+                      const q = colsQuery.trim().toLowerCase();
+                      if (q && !c.name.toLowerCase().includes(q)) return null;
+                      const visible = !hiddenCols.has(c.name);
+                      const isLastVisible = visible && visibleCount === 1;
+                      return (
+                        <label
+                          key={j}
+                          className={`flex items-center gap-2 px-2.5 py-1 text-[11px] hover:bg-bg-2 ${
+                            isLastVisible ? "opacity-60 cursor-not-allowed" : "cursor-pointer"
+                          }`}
+                          title={isLastVisible ? "At least one column must stay visible" : undefined}
+                        >
+                          <input
+                            type="checkbox"
+                            checked={visible}
+                            disabled={isLastVisible}
+                            onChange={(e) => {
+                              const next = new Set(hiddenCols);
+                              if (e.target.checked) next.delete(c.name);
+                              else next.add(c.name);
+                              setHiddenCols(next);
+                            }}
+                            className="cursor-pointer"
+                          />
+                          <span className="text-ink-2 truncate flex-1">{c.name}</span>
+                          <span className="text-subtle font-mono text-[10px] shrink-0">
+                            {c.type_name}
+                          </span>
+                        </label>
+                      );
+                    })}
+                  </div>
+                </div>
+              )}
+            </div>
+          );
+        })()}
+
         <div className="relative" ref={exportMenuRef}>
           <button
             onClick={() => setExportOpen((v) => !v)}
@@ -685,6 +859,9 @@ function ResultsPaneImpl(props: Props) {
           onSort={onSort}
           onClearSort={onClearSort}
           sort={sort ?? null}
+          hiddenCols={hiddenCols}
+          columnWidths={columnWidths}
+          onColumnWidthsChange={setColumnWidths}
         />
       ) : (
         <div className="flex-1 min-h-0 overflow-auto">
@@ -792,6 +969,9 @@ function TableView({
   onSort,
   onClearSort,
   sort,
+  hiddenCols,
+  columnWidths,
+  onColumnWidthsChange,
 }: {
   result: QueryResult;
   numericMask: boolean[];
@@ -807,6 +987,9 @@ function TableView({
   onSort?: (columnName: string, dir: "asc" | "desc") => void;
   onClearSort?: () => void;
   sort: { column: string; dir: "asc" | "desc" } | null;
+  hiddenCols: Set<string>;
+  columnWidths: Record<string, number>;
+  onColumnWidthsChange: (next: Record<string, number>) => void;
 }) {
   const [editing, setEditing] = useState<{ row: number; col: number } | null>(null);
   const [draft, setDraft] = useState("");
@@ -952,15 +1135,72 @@ function TableView({
   // each, so a header cell wider than its row data would produce different
   // column widths and visibly misalign the header from the body. Use pure
   // <length> minmax bounds so identical templates render identical tracks.
+  const visibleColIndices = useMemo(() => {
+    const out: number[] = [];
+    for (let j = 0; j < result.columns.length; j++) {
+      if (!hiddenCols.has(result.columns[j].name)) out.push(j);
+    }
+    // Defensive: if a stale `hiddenCols` (e.g. from a previous result schema)
+    // would hide every column in the current result, fall back to showing all
+    // so the grid isn't empty. The UI checkbox disable already prevents this
+    // for in-session toggling, but a result schema change could still trip it.
+    if (out.length === 0 && result.columns.length > 0) {
+      for (let j = 0; j < result.columns.length; j++) out.push(j);
+    }
+    return out;
+  }, [result.columns, hiddenCols]);
+
   const gridTemplate = useMemo(() => {
     const cols: string[] = [];
     if (editable) cols.push("36px");
     cols.push("48px"); // row number
-    for (let j = 0; j < result.columns.length; j++) {
-      cols.push(numericMask[j] ? "minmax(100px, 180px)" : "minmax(140px, 320px)");
+    for (const j of visibleColIndices) {
+      const name = result.columns[j].name;
+      const custom = columnWidths[name];
+      if (custom != null) {
+        cols.push(`${custom}px`);
+      } else {
+        cols.push(numericMask[j] ? "minmax(100px, 180px)" : "minmax(140px, 320px)");
+      }
     }
     return cols.join(" ");
-  }, [editable, numericMask, result.columns.length]);
+  }, [editable, numericMask, visibleColIndices, result.columns, columnWidths]);
+
+  // Resize handle drag — captures the header cell's current width at
+  // pointerdown so subsequent moves are relative to that, then updates the
+  // controlled width map on each move. We bind to window so the drag continues
+  // even if the pointer leaves the handle / cell.
+  function startResize(e: React.PointerEvent<HTMLDivElement>, colName: string) {
+    e.preventDefault();
+    e.stopPropagation();
+    const headerCell = (e.currentTarget as HTMLElement).parentElement;
+    if (!headerCell) return;
+    const startX = e.clientX;
+    const startWidth = headerCell.getBoundingClientRect().width;
+    const baseWidths = columnWidths;
+    function onMove(ev: PointerEvent) {
+      const next = Math.max(60, Math.min(1200, startWidth + (ev.clientX - startX)));
+      onColumnWidthsChange({ ...baseWidths, [colName]: next });
+    }
+    function onEnd() {
+      window.removeEventListener("pointermove", onMove);
+      window.removeEventListener("pointerup", onEnd);
+      document.body.style.cursor = "";
+      document.body.style.userSelect = "";
+    }
+    window.addEventListener("pointermove", onMove);
+    window.addEventListener("pointerup", onEnd);
+    // Lock cursor + suppress text selection during the drag so it feels native.
+    document.body.style.cursor = "col-resize";
+    document.body.style.userSelect = "none";
+  }
+
+  function resetColumnWidth(colName: string) {
+    if (columnWidths[colName] == null) return;
+    const next = { ...columnWidths };
+    delete next[colName];
+    onColumnWidthsChange(next);
+  }
 
   const scrollRef = useRef<HTMLDivElement | null>(null);
   const rowVirtualizer = useVirtualizer({
@@ -1014,7 +1254,8 @@ function TableView({
           <div className="flex items-center justify-end px-2 text-[11px] font-semibold text-muted border-r border-border/40 select-none">
             #
           </div>
-          {result.columns.map((c, j) => {
+          {visibleColIndices.map((j) => {
+            const c = result.columns[j];
             const sorted = sort?.column === c.name ? sort.dir : null;
             const sortable = !!onSort;
             const filterSet = filters[j];
@@ -1024,7 +1265,7 @@ function TableView({
               <div
                 key={c.name}
                 onClick={() => setActiveCol(j)}
-                className={`flex items-center px-2 text-[11px] font-semibold text-ink-2 whitespace-nowrap overflow-hidden border-r border-border/40 select-none cursor-pointer ${
+                className={`relative flex items-center px-2 text-[11px] font-semibold text-ink-2 whitespace-nowrap overflow-hidden border-r border-border/40 select-none cursor-pointer ${
                   numericMask[j] ? "justify-end" : "justify-start"
                 } ${isActive ? "bg-acc-soft/60" : sorted ? "bg-acc-soft/40" : ""}`}
               >
@@ -1106,6 +1347,17 @@ function TableView({
                     <path d="M1 1.5 H9 L6 5.2 V8.5 L4 9.2 V5.2 Z" />
                   </svg>
                 </button>
+                <div
+                  onPointerDown={(e) => startResize(e, c.name)}
+                  onDoubleClick={(e) => {
+                    e.stopPropagation();
+                    resetColumnWidth(c.name);
+                  }}
+                  title="Drag to resize · double-click to reset"
+                  className="group absolute top-0 right-0 h-full w-1.5 cursor-col-resize z-10"
+                >
+                  <div className="absolute right-0 top-1 bottom-1 w-px bg-transparent group-hover:bg-acc transition-colors" />
+                </div>
               </div>
             );
           })}
@@ -1156,7 +1408,8 @@ function TableView({
               <div className="flex items-center justify-end px-2 text-[11px] text-subtle font-mono tabular-nums select-none border-r border-border/30">
                 {visIdx + 1}
               </div>
-              {row.map((cell, j) => {
+              {visibleColIndices.map((j) => {
+                const cell = row[j];
                 const pending = pendingEdits.get(`${originalIdx}-${j}`);
                 const displayCell = pending ? pending.value : cell;
                 const rendered = renderCell(displayCell);
