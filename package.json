@@ -17,6 +17,8 @@
     "@tauri-apps/plugin-dialog": "^2.7.1",
     "@tauri-apps/plugin-fs": "^2.5.1",
     "@tauri-apps/plugin-opener": "^2",
+    "@tauri-apps/plugin-updater": "^2",
+    "@tauri-apps/plugin-process": "^2",
     "@uiw/react-codemirror": "^4.25.10",
     "mermaid": "^11.15.0",
     "react": "^19.1.0",

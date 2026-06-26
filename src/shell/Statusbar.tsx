@@ -19,6 +19,10 @@ type Props = {
   activeAiName: string | null;
   activeEmbeddingName: string | null;
   version?: string;
+  updateAvailable: { version: string } | null;
+  updateDownloading: boolean;
+  updateProgress: number | null;
+  onUpdate: () => void;
 };
 
 function nowUtc(): string {
@@ -44,6 +48,10 @@ export function Statusbar({
   activeAiName,
   activeEmbeddingName,
   version = "0.3.5",
+  updateAvailable,
+  updateDownloading,
+  updateProgress,
+  onUpdate,
 }: Props) {
   const [clock, setClock] = useState(nowUtc());
 
@@ -206,7 +214,27 @@ export function Statusbar({
       )}
       <span className="tabular-nums">{clock}</span>
       <span className="text-border-2">·</span>
-      <span>SquireDB v{version}</span>
+      {updateDownloading ? (
+        <span
+          className="flex items-center gap-1.5 px-2 h-4 rounded-full bg-acc-soft/60 text-acc font-medium tabular-nums"
+          title="Downloading update…"
+        >
+          <span className="w-2 h-2 rounded-full bg-acc animate-pulse" />
+          {updateProgress != null ? `Updating ${updateProgress}%` : "Updating…"}
+        </span>
+      ) : updateAvailable ? (
+        <button
+          type="button"
+          onClick={onUpdate}
+          className="flex items-center gap-1.5 px-2 h-4 rounded-full bg-acc-soft/60 hover:bg-acc-soft text-acc font-medium transition cursor-pointer"
+          title={`Click to update to v${updateAvailable.version}`}
+        >
+          <span className="w-1.5 h-1.5 rounded-full bg-acc" />
+          <span>↑ v{updateAvailable.version} available</span>
+        </button>
+      ) : (
+        <span>SquireDB v{version}</span>
+      )}
     </div>
   );
 }

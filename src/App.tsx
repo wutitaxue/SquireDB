@@ -56,6 +56,7 @@ import { SearchBar, type FilterChipDef } from "./shell/atoms/SearchBar";
 import { SchemaTreeView, type SchemaFilter } from "./shell/views/SchemaTreeView";
 import { ConnSecondary } from "./shell/views/ConnSecondary";
 import { Statusbar } from "./shell/Statusbar";
+import { useUpdater } from "./hooks/useUpdater";
 import {
   AGENT_META,
   agentTabId,
@@ -89,6 +90,7 @@ const INITIAL_INJECTION: Injection = Object.freeze({
 }) as Injection;
 
 function App() {
+  const updater = useUpdater();
   const [connections, setConnections] = useState<Connection[]>([]);
   const [mode, setMode] = useState<AppMode>({ kind: "home" });
   const [editing, setEditing] = useState<Connection | null>(null);
@@ -1852,6 +1854,10 @@ function App() {
         projectConnsTotal={projectStats.connsTotal}
         activeAiName={activeAiName}
         activeEmbeddingName={activeEmbeddingName}
+        updateAvailable={updater.available}
+        updateDownloading={updater.downloading}
+        updateProgress={updater.progress}
+        onUpdate={updater.install}
       />
 
       {showSettings && (
