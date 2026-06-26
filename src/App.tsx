@@ -1800,6 +1800,7 @@ function App() {
                 onOpenAgent={(id) => openAgent(id as AgentId)}
                 insight={connInsight}
                 activity={connActivity}
+                onClose={() => setDockOpen(false)}
               />
             )}
           </>
@@ -1815,6 +1816,7 @@ function App() {
             onEditProject={() => setEditingProject(activeProject)}
             onStatsChange={setProjectStats}
             dockOpen={dockOpen}
+            onCloseDock={() => setDockOpen(false)}
             onTablePreview={(t) => void openProjectPreview(t)}
             onTableDrill={(t) => openProjectDrill(t)}
             onTableContextMenu={(e, t) => {
