@@ -99,6 +99,30 @@ jobs:
       - name: Install frontend deps
         run: npm ci
 
+      - name: Sync version from tag
+        shell: bash
+        run: |
+          set -euo pipefail
+          VERSION="${GITHUB_REF_NAME#v}"
+          echo "Syncing version to: $VERSION"
+          npm version "$VERSION" --no-git-tag-version --allow-same-version
+          node -e "
+            const f='src-tauri/tauri.conf.json';
+            const fs=require('fs');
+            const o=JSON.parse(fs.readFileSync(f,'utf8'));
+            o.version='$VERSION';
+            fs.writeFileSync(f, JSON.stringify(o, null, 2) + '\n');
+          "
+          # Cargo.toml: only replace the first 'version = "..."' (package section)
+          awk -v v="$VERSION" '
+            !done && /^version = "/ { print "version = \"" v "\""; done=1; next }
+            { print }
+          ' src-tauri/Cargo.toml > src-tauri/Cargo.toml.tmp && mv src-tauri/Cargo.toml.tmp src-tauri/Cargo.toml
+          (cd src-tauri && cargo update -p squiredb)
+          echo "--- After sync ---"
+          grep '"version"' src-tauri/tauri.conf.json package.json
+          grep '^version' src-tauri/Cargo.toml
+
       - name: Prepare Tauri signing key
         shell: bash
         run: |

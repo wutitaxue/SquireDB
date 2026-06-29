@@ -18,7 +18,7 @@ type Props = {
   projectConnsTotal: number;
   activeAiName: string | null;
   activeEmbeddingName: string | null;
-  version?: string;
+  version: string;
   updateAvailable: { version: string } | null;
   updateDownloading: boolean;
   updateProgress: number | null;
@@ -47,7 +47,7 @@ export function Statusbar({
   projectConnsTotal,
   activeAiName,
   activeEmbeddingName,
-  version = "0.3.5",
+  version,
   updateAvailable,
   updateDownloading,
   updateProgress,
@@ -233,7 +233,7 @@ export function Statusbar({
           <span>↑ v{updateAvailable.version} available</span>
         </button>
       ) : (
-        <span>SquireDB v{version}</span>
+        <span>{version ? `SquireDB v${version}` : "SquireDB"}</span>
       )}
     </div>
   );

@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { getVersion } from "@tauri-apps/api/app";
 import { save as saveDialog } from "@tauri-apps/plugin-dialog";
 import { writeTextFile } from "@tauri-apps/plugin-fs";
 import {
@@ -91,6 +92,10 @@ const INITIAL_INJECTION: Injection = Object.freeze({
 
 function App() {
   const updater = useUpdater();
+  const [appVersion, setAppVersion] = useState("");
+  useEffect(() => {
+    void getVersion().then(setAppVersion).catch(() => {});
+  }, []);
   const [connections, setConnections] = useState<Connection[]>([]);
   const [mode, setMode] = useState<AppMode>({ kind: "home" });
   const [editing, setEditing] = useState<Connection | null>(null);
@@ -1856,6 +1861,7 @@ function App() {
         projectConnsTotal={projectStats.connsTotal}
         activeAiName={activeAiName}
         activeEmbeddingName={activeEmbeddingName}
+        version={appVersion}
         updateAvailable={updater.available}
         updateDownloading={updater.downloading}
         updateProgress={updater.progress}
