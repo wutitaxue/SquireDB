@@ -8,8 +8,9 @@ import type {
   McpStatus,
 } from "../types";
 import { copyText } from "../utils";
+import { SyncForm } from "./SyncForm";
 
-type TabKind = "chat" | "embedding" | "mcp";
+type TabKind = "chat" | "embedding" | "mcp" | "sync";
 
 export function SettingsModal({ onClose }: { onClose: () => void }) {
   const [tab, setTab] = useState<TabKind>("chat");
@@ -49,6 +50,9 @@ export function SettingsModal({ onClose }: { onClose: () => void }) {
           <TabButton active={tab === "mcp"} onClick={() => setTab("mcp")}>
             MCP Server
           </TabButton>
+          <TabButton active={tab === "sync"} onClick={() => setTab("sync")}>
+            Cloud Sync
+          </TabButton>
         </div>
 
         <div className="overflow-y-auto">
@@ -56,8 +60,10 @@ export function SettingsModal({ onClose }: { onClose: () => void }) {
             <ChatForm onClose={onClose} />
           ) : tab === "embedding" ? (
             <EmbeddingForm onClose={onClose} />
-          ) : (
+          ) : tab === "mcp" ? (
             <McpForm onClose={onClose} />
+          ) : (
+            <SyncForm onClose={onClose} />
           )}
         </div>
       </div>

@@ -19,6 +19,7 @@ mod query;
 mod redis_kind;
 mod sqlite_query;
 mod storage;
+mod sync;
 
 use serde::Serialize;
 use sqlx::mysql::{MySqlConnectOptions, MySqlPoolOptions};
@@ -4238,6 +4239,120 @@ async fn get_innodb_status_raw(
     Ok(text)
 }
 
+// ---------- Cloud sync (S3) ---------- //
+
+const APP_VERSION_FOR_SYNC: &str = env!("CARGO_PKG_VERSION");
+
+#[tauri::command]
+async fn sync_get_config(
+    state: State<'_, AppState>,
+) -> Result<sync::config::SyncConfigDisplay, String> {
+    sync::config::load_display(&state.sqlite).await
+}
+
+#[tauri::command]
+async fn sync_save_config(
+    state: State<'_, AppState>,
+    input: sync::config::SyncConfigInput,
+) -> Result<(), String> {
+    sync::config::save(&state.sqlite, &input).await?;
+    // Verify by listing — surfaces wrong AK/SK / bucket / endpoint early.
+    let cfg = sync::config::load_full(&state.sqlite).await?;
+    sync::s3::list_devices(&cfg)
+        .await
+        .map_err(|e| format!("verify list: {e}"))?;
+    Ok(())
+}
+
+#[tauri::command]
+async fn sync_clear_config(state: State<'_, AppState>) -> Result<(), String> {
+    sync::config::clear(&state.sqlite).await
+}
+
+#[derive(Serialize)]
+struct SyncPushResult {
+    device_name: String,
+    object_key: String,
+    bytes: usize,
+    pushed_at: String,
+}
+
+#[tauri::command]
+async fn sync_push(state: State<'_, AppState>) -> Result<SyncPushResult, String> {
+    let cfg = sync::config::load_full(&state.sqlite).await?;
+    let disp = sync::config::load_display(&state.sqlite).await?;
+    let snapshot =
+        sync::snapshot::dump(&state.sqlite, &disp.device_name, APP_VERSION_FOR_SYNC).await?;
+    let bytes = sync::bundle::pack(&snapshot)?;
+    let key = sync::s3::build_key(&cfg.prefix, &disp.device_name);
+    sync::s3::put_object(&cfg, &key, &bytes).await?;
+    let now = chrono::Utc::now().to_rfc3339();
+    sync::config::mark_pushed(&state.sqlite, &now).await?;
+    Ok(SyncPushResult {
+        device_name: disp.device_name,
+        object_key: key,
+        bytes: bytes.len(),
+        pushed_at: now,
+    })
+}
+
+#[tauri::command]
+async fn sync_list_devices(
+    state: State<'_, AppState>,
+) -> Result<Vec<sync::s3::DeviceObject>, String> {
+    let cfg = sync::config::load_full(&state.sqlite).await?;
+    sync::s3::list_devices(&cfg).await
+}
+
+#[derive(Serialize)]
+struct SyncPullPreview {
+    device_name: String,
+    meta: sync::bundle::BundleMeta,
+    conflict_report: sync::snapshot::ConflictReport,
+    snapshot: sync::snapshot::Snapshot,
+}
+
+#[tauri::command]
+async fn sync_preview_pull(
+    state: State<'_, AppState>,
+    device_name: String,
+) -> Result<SyncPullPreview, String> {
+    let cfg = sync::config::load_full(&state.sqlite).await?;
+    let key = sync::s3::build_key(&cfg.prefix, &device_name);
+    let bytes = sync::s3::get_object(&cfg, &key).await?;
+    let (meta, snapshot) = sync::bundle::unpack(&bytes)?;
+    let conflict_report = sync::snapshot::diff(&state.sqlite, &snapshot).await?;
+    Ok(SyncPullPreview {
+        device_name,
+        meta,
+        conflict_report,
+        snapshot,
+    })
+}
+
+#[tauri::command]
+async fn sync_apply_pull(
+    state: State<'_, AppState>,
+    device_name: String,
+    snapshot: sync::snapshot::Snapshot,
+    resolutions: sync::snapshot::ResolutionMap,
+) -> Result<sync::snapshot::RestoreReport, String> {
+    let report = sync::snapshot::restore(&state.sqlite, &snapshot, &resolutions).await?;
+    let now = chrono::Utc::now().to_rfc3339();
+    sync::config::mark_pulled(&state.sqlite, &now, &device_name).await?;
+    Ok(report)
+}
+
+#[tauri::command]
+async fn sync_delete_device(
+    state: State<'_, AppState>,
+    device_name: String,
+) -> Result<(), String> {
+    let cfg = sync::config::load_full(&state.sqlite).await?;
+    let key = sync::s3::build_key(&cfg.prefix, &device_name);
+    sync::s3::delete_object(&cfg, &key).await
+}
+
 // ---------- MCP settings commands ---------- //
 
 #[derive(Serialize)]
@@ -4789,6 +4904,14 @@ pub fn run() {
             drop_table,
             ai_table_edit,
             ai_create_table,
+            sync_get_config,
+            sync_save_config,
+            sync_clear_config,
+            sync_push,
+            sync_list_devices,
+            sync_preview_pull,
+            sync_apply_pull,
+            sync_delete_device,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
