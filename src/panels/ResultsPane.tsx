@@ -29,6 +29,36 @@ const EXPORT_FORMATS: ExportFormat[] = ["csv", "json", "markdown", "sql"];
 
 type ViewKind = "table" | "chart" | "json" | "plan";
 
+// --- Header chrome measurement ----------------------------------------------
+// Measure header text with a cached canvas so column-width math is exact rather
+// than guessed from character counts.
+let _hdrCtx: CanvasRenderingContext2D | null = null;
+function measureHdrText(text: string, font: string): number {
+  if (typeof document === "undefined") return text.length * 7;
+  if (!_hdrCtx) _hdrCtx = document.createElement("canvas").getContext("2d");
+  if (!_hdrCtx) return text.length * 7;
+  _hdrCtx.font = font;
+  return _hdrCtx.measureText(text).width;
+}
+
+const HDR_NAME_FONT = "600 11px system-ui, -apple-system, sans-serif";
+const HDR_TYPE_FONT = "400 10px ui-monospace, SFMono-Regular, monospace";
+const DATA_FONT = "12px ui-monospace, SFMono-Regular, monospace";
+
+// Width budget for a header cell. `min` fits the name (+ PK icon) and BOTH the
+// sort/filter buttons — the resize floor, so they can never be clipped. `full`
+// additionally fits the type label; below `full` the type label is dropped.
+function colChrome(name: string, typeName: string, isPk: boolean): { min: number; full: number } {
+  const PAD = 16; // px-2 on both sides
+  const PK = isPk ? 22 : 0; // 🔑 + mr-1
+  const BUTTONS = 46; // sort (w-5) + filter (w-5) + gaps
+  const SLACK = 8;
+  const nameW = measureHdrText(name, HDR_NAME_FONT);
+  const typeW = measureHdrText(typeName, HDR_TYPE_FONT) + 6; // + ml-1.5
+  const min = Math.ceil(PAD + PK + nameW + BUTTONS + SLACK);
+  return { min, full: Math.ceil(min + typeW) };
+}
+
 type Props = {
   connectionId: number | null;
   result: QueryResult;
@@ -1150,27 +1180,57 @@ function TableView({
     return out;
   }, [result.columns, hiddenCols]);
 
+  // Widest rendered data value per column (px), sampled over the first rows.
+  // Drives content-aware default widths so short-content columns (numbers,
+  // booleans, short enums) hug their content instead of ballooning, while long
+  // text columns grow up to the cap.
+  const colDataWidths = useMemo(() => {
+    const widths = new Array<number>(result.columns.length).fill(0);
+    const sample = result.rows.slice(0, 80);
+    for (let i = 0; i < result.columns.length; i++) {
+      let max = 0;
+      for (const row of sample) {
+        const v = row[i];
+        if (v === null || v === undefined) continue;
+        const s = typeof v === "object" ? JSON.stringify(v) : String(v);
+        const w = measureHdrText(s.length > 64 ? s.slice(0, 64) : s, DATA_FONT);
+        if (w > max) max = w;
+      }
+      widths[i] = max;
+    }
+    return widths;
+  }, [result]);
+
   const gridTemplate = useMemo(() => {
+    const DATA_CAP = 320; // upper bound for long-text columns
+    const DATA_PAD = 24; // px-2 cell padding + slack
     const cols: string[] = [];
     if (editable) cols.push("36px");
     cols.push("48px"); // row number
     for (const j of visibleColIndices) {
-      const name = result.columns[j].name;
-      const custom = columnWidths[name];
+      const col = result.columns[j];
+      const { min, full } = colChrome(col.name, col.type_name, pkSet.has(j));
+      const custom = columnWidths[col.name];
       if (custom != null) {
-        cols.push(`${custom}px`);
+        // Never render narrower than the floor that fits name + buttons, so a
+        // stale/over-dragged width can't clip the action buttons.
+        cols.push(`${Math.max(min, custom)}px`);
       } else {
-        cols.push(numericMask[j] ? "minmax(100px, 180px)" : "minmax(140px, 320px)");
+        // Content-aware default: at least wide enough for the header (name +
+        // type + buttons), growing to fit the data up to the cap. Type matters
+        // only as a floor — short data never balloons, long data is bounded.
+        const dataW = Math.ceil(colDataWidths[j] + DATA_PAD);
+        cols.push(`${Math.max(full, Math.min(DATA_CAP, dataW))}px`);
       }
     }
     return cols.join(" ");
-  }, [editable, numericMask, visibleColIndices, result.columns, columnWidths]);
+  }, [editable, visibleColIndices, result.columns, columnWidths, pkSet, colDataWidths]);
 
   // Resize handle drag — captures the header cell's current width at
   // pointerdown so subsequent moves are relative to that, then updates the
   // controlled width map on each move. We bind to window so the drag continues
   // even if the pointer leaves the handle / cell.
-  function startResize(e: React.PointerEvent<HTMLDivElement>, colName: string) {
+  function startResize(e: React.PointerEvent<HTMLDivElement>, colName: string, minW: number) {
     e.preventDefault();
     e.stopPropagation();
     const headerCell = (e.currentTarget as HTMLElement).parentElement;
@@ -1179,7 +1239,7 @@ function TableView({
     const startWidth = headerCell.getBoundingClientRect().width;
     const baseWidths = columnWidths;
     function onMove(ev: PointerEvent) {
-      const next = Math.max(60, Math.min(1200, startWidth + (ev.clientX - startX)));
+      const next = Math.max(minW, Math.min(1200, startWidth + (ev.clientX - startX)));
       onColumnWidthsChange({ ...baseWidths, [colName]: next });
     }
     function onEnd() {
@@ -1261,6 +1321,17 @@ function TableView({
             const filterSet = filters[j];
             const hasFilter = !!filterSet && filterSet.size > 0;
             const isActive = activeCol === j;
+            // The name (+ PK icon) and both action buttons always stay visible
+            // (the resize floor guarantees room for them). Only the type label
+            // yields: drop it once a dragged column is narrower than the width
+            // that fits name + type + buttons.
+            const draggedW = columnWidths[c.name];
+            const { min: minColW, full: fullColW } = colChrome(
+              c.name,
+              c.type_name,
+              pkSet.has(j),
+            );
+            const hideType = draggedW != null && draggedW < fullColW;
             return (
               <div
                 key={c.name}
@@ -1269,13 +1340,15 @@ function TableView({
                   numericMask[j] ? "justify-end" : "justify-start"
                 } ${isActive ? "bg-acc-soft/60" : sorted ? "bg-acc-soft/40" : ""}`}
               >
-                <span className="truncate">
-                  {pkSet.has(j) && <span className="text-acc mr-1" title="Primary key">🔑</span>}
+                <span className="shrink-0 whitespace-nowrap flex items-center">
+                  {pkSet.has(j) && <span className="text-acc mr-1 shrink-0" title="Primary key">🔑</span>}
                   {c.name}
                 </span>
-                <span className="text-subtle font-mono font-normal ml-1.5 text-[10px] shrink-0">
-                  {c.type_name}
-                </span>
+                {!hideType && (
+                  <span className="text-subtle font-mono font-normal ml-1.5 text-[10px] shrink-0 whitespace-nowrap">
+                    {c.type_name}
+                  </span>
+                )}
                 <span className="flex-1" />
                 {sortable && (
                   <button
@@ -1348,7 +1421,7 @@ function TableView({
                   </svg>
                 </button>
                 <div
-                  onPointerDown={(e) => startResize(e, c.name)}
+                  onPointerDown={(e) => startResize(e, c.name, minColW)}
                   onDoubleClick={(e) => {
                     e.stopPropagation();
                     resetColumnWidth(c.name);
