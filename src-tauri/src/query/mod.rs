@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 use sqlx::mysql::{MySqlConnectOptions, MySqlPoolOptions, MySqlRow};
-use sqlx::{Column, MySqlPool, Row, TypeInfo, ValueRef};
+use sqlx::{Column, Decode, MySql, MySqlPool, Row, TypeInfo, ValueRef};
 use std::time::{Duration, Instant};
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -494,8 +494,14 @@ pub fn value_to_json(row: &MySqlRow, idx: usize) -> serde_json::Value {
             .try_get::<f64, _>(idx)
             .map(serde_json::Value::from)
             .unwrap_or(serde_json::Value::Null),
-        "DECIMAL" | "NUMERIC" => row
-            .try_get::<String, _>(idx)
+        // DECIMAL/NEWDECIMAL (e.g. SUM(), AVG(), CAST(.. AS DECIMAL)) are not
+        // `compatible` with String in sqlx's type check, so `try_get::<String>`
+        // errors out and silently yields null. Decode from the raw value to
+        // bypass the type-compatibility check; the wire bytes are ASCII text.
+        "DECIMAL" | "NUMERIC" | "NEWDECIMAL" => row
+            .try_get_raw(idx)
+            .ok()
+            .and_then(|raw| <String as Decode<MySql>>::decode(raw).ok())
             .map(serde_json::Value::from)
             .unwrap_or(serde_json::Value::Null),
         "BOOLEAN" => row
