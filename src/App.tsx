@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { getVersion } from "@tauri-apps/api/app";
 import { save as saveDialog } from "@tauri-apps/plugin-dialog";
@@ -111,6 +111,24 @@ function App() {
   >({});
   const [expandedDbs, setExpandedDbs] = useState<Set<string>>(new Set());
   const [expandedTables, setExpandedTables] = useState<Set<string>>(new Set());
+
+  // Table → column-name map fed to the SQL editor's schema-aware completion.
+  // Built from whatever the schema tree has already loaded: every known table
+  // gets a bare-name entry (so table-name completion works immediately) plus a
+  // `db.table` entry, and columns fill in for tables the user has expanded.
+  // Memoized so the editor only reconfigures when tree data changes, not on
+  // every keystroke / re-render (QueryWorkspace is memoized on this identity).
+  const completionSchema = useMemo(() => {
+    const map: Record<string, string[]> = {};
+    for (const [db, tables] of Object.entries(tablesByDb)) {
+      for (const t of tables) {
+        const cols = (columnsByTableKey[`${db}.${t.name}`] ?? []).map((c) => c.name);
+        map[t.name] = cols;
+        map[`${db}.${t.name}`] = cols;
+      }
+    }
+    return map;
+  }, [tablesByDb, columnsByTableKey]);
   const [selectedKey, setSelectedKey] = useState<string | null>(null);
   const [showSystemDbs, setShowSystemDbs] = useState(false);
   const [schemaQuery, setSchemaQuery] = useState("");
@@ -1774,6 +1792,7 @@ function App() {
                         databases={databases}
                         database={tab.database}
                         onChangeDatabase={(next) => setTabDatabase(tab.id, next)}
+                        schema={completionSchema}
                       />
                     </div>
                   ))}

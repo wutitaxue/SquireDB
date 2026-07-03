@@ -40,6 +40,8 @@ type Props = {
    *  connection's default. */
   database: string | undefined;
   onChangeDatabase: (next: string | undefined) => void;
+  /** Table → column-name map for schema-aware editor completion. */
+  schema?: Record<string, string[]>;
 };
 
 function QueryWorkspaceImpl({
@@ -51,6 +53,7 @@ function QueryWorkspaceImpl({
   databases,
   database,
   onChangeDatabase,
+  schema,
 }: Props) {
   const [sql, setSql] = useState(injection.sql);
   const [batch, setBatch] = useState<BatchEntry[]>([]);
@@ -431,7 +434,7 @@ function QueryWorkspaceImpl({
         style={{ height: "34%", minHeight: 180, maxHeight: "60%" }}
       >
         <div className="flex-1 min-h-0 overflow-y-auto">
-          <SqlEditor value={sql} onChange={stableSetSql} onRun={stableRun} editorRef={editorRef} />
+          <SqlEditor value={sql} onChange={stableSetSql} onRun={stableRun} editorRef={editorRef} schema={schema} />
         </div>
         <div className="px-2 py-2 bg-panel-2 border-t border-border shrink-0">
           <AiStrip
