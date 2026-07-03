@@ -120,8 +120,18 @@ pub struct McpSettingsEntry {
     /// Original FK was a JSON list of connection ids; re-encoded as connection names
     /// so the foreign references survive id reshuffling on the receiving side.
     pub allowed_conn_names: Vec<String>,
+    /// Per-database write grants, connection re-encoded as name (see above).
+    #[serde(default)]
+    pub write_databases: Vec<McpWriteDbEntry>,
     /// Plaintext MCP token.
     pub token: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct McpWriteDbEntry {
+    pub connection_name: String,
+    pub database: String,
+    pub ops: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -440,14 +450,15 @@ async fn dump_mcp_settings(
     pool: &SqlitePool,
     id_to_conn: &HashMap<i64, String>,
 ) -> Result<Option<McpSettingsEntry>, String> {
-    let row: Option<(i64, i64, i64, String)> = sqlx::query_as(
-        "SELECT enabled, bind_port, read_only, allowed_conn_ids FROM mcp_settings WHERE id = 1",
+    let row: Option<(i64, i64, i64, String, String)> = sqlx::query_as(
+        "SELECT enabled, bind_port, read_only, allowed_conn_ids, write_databases FROM mcp_settings WHERE id = 1",
     )
     .fetch_optional(pool)
     .await
     .map_err(|e| format!("dump mcp_settings: {e}"))?;
 
-    let Some((enabled, bind_port, read_only, allowed_conn_ids_json)) = row else {
+    let Some((enabled, bind_port, read_only, allowed_conn_ids_json, write_databases_json)) = row
+    else {
         return Ok(None);
     };
 
@@ -457,6 +468,20 @@ async fn dump_mcp_settings(
         .into_iter()
         .filter_map(|id| id_to_conn.get(&id).cloned())
         .collect();
+
+    let write_perms: Vec<crate::storage::mcp_settings::WriteDbPerm> =
+        serde_json::from_str(&write_databases_json).unwrap_or_default();
+    let write_databases: Vec<McpWriteDbEntry> = write_perms
+        .into_iter()
+        .filter_map(|p| {
+            id_to_conn.get(&p.connection_id).map(|name| McpWriteDbEntry {
+                connection_name: name.clone(),
+                database: p.database,
+                ops: p.ops,
+            })
+        })
+        .collect();
+
     let token = crypto::get_mcp_token(pool).await.unwrap_or_default();
 
     Ok(Some(McpSettingsEntry {
@@ -464,6 +489,7 @@ async fn dump_mcp_settings(
         bind_port,
         read_only: read_only != 0,
         allowed_conn_names,
+        write_databases,
         token,
     }))
 }
@@ -920,6 +946,9 @@ fn diff_mcp(local: &Snapshot, remote: &Snapshot, report: &mut ConflictReport) {
                 fmt_diff_line("allowed_conn_names", &l.allowed_conn_names, &r.allowed_conn_names)
             {
                 diff_lines.push(s);
+            }
+            if l.write_databases != r.write_databases {
+                diff_lines.push("write_databases: (changed)".to_string());
             }
             if l.token != r.token {
                 diff_lines.push("token: (changed)".to_string());
@@ -1492,6 +1521,22 @@ pub async fn restore(
             .collect();
         let allowed_json = serde_json::to_string(&allowed_ids).unwrap_or_else(|_| "[]".to_string());
 
+        let write_perms: Vec<crate::storage::mcp_settings::WriteDbPerm> = m
+            .write_databases
+            .iter()
+            .filter_map(|w| {
+                remote_conn_to_local_id.get(&w.connection_name).map(|id| {
+                    crate::storage::mcp_settings::WriteDbPerm {
+                        connection_id: *id,
+                        database: w.database.clone(),
+                        ops: w.ops.clone(),
+                    }
+                })
+            })
+            .collect();
+        let write_databases_json =
+            serde_json::to_string(&write_perms).unwrap_or_else(|_| "[]".to_string());
+
         let apply = match (exists, resolutions.get(EntryKind::McpSettings, "default")) {
             (None, _) => true,
             (Some(_), Resolution::Overwrite) => true,
@@ -1500,19 +1545,21 @@ pub async fn restore(
         };
         if apply {
             sqlx::query(
-                "INSERT INTO mcp_settings (id, enabled, bind_port, read_only, allowed_conn_ids, updated_at) \
-                 VALUES (1, ?, ?, ?, ?, CURRENT_TIMESTAMP) \
+                "INSERT INTO mcp_settings (id, enabled, bind_port, read_only, allowed_conn_ids, write_databases, updated_at) \
+                 VALUES (1, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP) \
                  ON CONFLICT(id) DO UPDATE SET \
                    enabled = excluded.enabled, \
                    bind_port = excluded.bind_port, \
                    read_only = excluded.read_only, \
                    allowed_conn_ids = excluded.allowed_conn_ids, \
+                   write_databases = excluded.write_databases, \
                    updated_at = CURRENT_TIMESTAMP",
             )
             .bind(if m.enabled { 1 } else { 0 })
             .bind(m.bind_port)
             .bind(if m.read_only { 1 } else { 0 })
             .bind(&allowed_json)
+            .bind(&write_databases_json)
             .execute(pool)
             .await
             .map_err(|e| format!("upsert mcp_settings: {e}"))?;

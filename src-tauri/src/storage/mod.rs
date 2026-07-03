@@ -370,12 +370,20 @@ async fn init_schema(pool: &SqlitePool) -> Result<(), sqlx::Error> {
             bind_port INTEGER NOT NULL DEFAULT 7421,
             read_only INTEGER NOT NULL DEFAULT 1,
             allowed_conn_ids TEXT NOT NULL DEFAULT '[]',
+            write_databases TEXT NOT NULL DEFAULT '[]',
             updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
         )
         "#,
     )
     .execute(pool)
     .await?;
+
+    // Migration: add write_databases column on existing dbs. Suppress duplicate-column error.
+    let _ = sqlx::query(
+        "ALTER TABLE mcp_settings ADD COLUMN write_databases TEXT NOT NULL DEFAULT '[]'",
+    )
+    .execute(pool)
+    .await;
 
     Ok(())
 }

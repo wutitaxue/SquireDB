@@ -109,11 +109,18 @@ export type ActiveEmbeddingSummary = {
   model: string | null;
 };
 
+export type McpWriteDbPerm = {
+  connectionId: number;
+  database: string;
+  ops: string[]; // subset of "insert" | "update" | "delete"
+};
+
 export type McpStatus = {
   enabled: boolean;
   bindPort: number;
   readOnly: boolean;
   allowedConnIds: number[];
+  writeDatabases: McpWriteDbPerm[];
   running: boolean;
   actualPort: number;
   requiresRestart: boolean;

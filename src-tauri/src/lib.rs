@@ -4362,6 +4362,7 @@ struct McpStatus {
     bind_port: u16,
     read_only: bool,
     allowed_conn_ids: Vec<i64>,
+    write_databases: Vec<storage::mcp_settings::WriteDbPerm>,
     running: bool,
     actual_port: u16,
     requires_restart: bool,
@@ -4390,6 +4391,7 @@ async fn get_mcp_status(state: State<'_, AppState>) -> Result<McpStatus, String>
         bind_port: settings.bind_port,
         read_only: settings.read_only,
         allowed_conn_ids: settings.allowed_conn_ids,
+        write_databases: settings.write_databases,
         running,
         actual_port,
         requires_restart,
@@ -4431,6 +4433,32 @@ async fn set_mcp_allowed_conns(
     storage::mcp_settings::save(&state.sqlite, &s).await?;
     // Live-update the shared snapshot — server picks it up on next request.
     *state.mcp_allowed_conns.write().await = ids;
+    get_mcp_status(state).await
+}
+
+#[tauri::command]
+async fn set_mcp_read_only(
+    state: State<'_, AppState>,
+    read_only: bool,
+) -> Result<McpStatus, String> {
+    let mut s = storage::mcp_settings::get(&state.sqlite).await?;
+    s.read_only = read_only;
+    storage::mcp_settings::save(&state.sqlite, &s).await?;
+    get_mcp_status(state).await
+}
+
+#[tauri::command]
+async fn set_mcp_write_databases(
+    state: State<'_, AppState>,
+    write_databases: Vec<storage::mcp_settings::WriteDbPerm>,
+) -> Result<McpStatus, String> {
+    let mut s = storage::mcp_settings::get(&state.sqlite).await?;
+    // Drop empty-op grants so they don't linger as no-op rows.
+    s.write_databases = write_databases
+        .into_iter()
+        .filter(|p| !p.ops.is_empty())
+        .collect();
+    storage::mcp_settings::save(&state.sqlite, &s).await?;
     get_mcp_status(state).await
 }
 
@@ -4885,6 +4913,8 @@ pub fn run() {
             set_mcp_enabled,
             set_mcp_port,
             set_mcp_allowed_conns,
+            set_mcp_read_only,
+            set_mcp_write_databases,
             get_mcp_token,
             regenerate_mcp_token,
             get_table_structure,
