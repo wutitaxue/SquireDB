@@ -14,12 +14,14 @@ mod health;
 mod llm_log;
 mod mcp;
 mod milvus;
+mod objects;
 mod perf;
 mod query;
 mod redis_kind;
 mod sqlite_query;
 mod storage;
 mod sync;
+mod users;
 
 use serde::Serialize;
 use sqlx::mysql::{MySqlConnectOptions, MySqlPoolOptions};
@@ -48,6 +50,15 @@ struct AppState {
     active_redis: Mutex<HashMap<i64, redis::aio::ConnectionManager>>,
     // query_token -> (connection_id, mysql_thread_id) for in-flight queries
     running_queries: Arc<Mutex<HashMap<String, (i64, u64)>>>,
+    // Manual-transaction sessions: txn_id (frontend tab id) -> (connection_id,
+    // the single pooled connection that BEGIN ran on). Every statement in the
+    // transaction must run on this same physical connection, so we hold it out
+    // of the pool until COMMIT / ROLLBACK returns it. The connection_id lets
+    // close/delete drop a connection's transactions before closing its pool.
+    // Inner Mutex serializes statements on the connection without holding the
+    // outer map lock for the query's duration.
+    active_txns:
+        Mutex<HashMap<String, (i64, Arc<Mutex<sqlx::pool::PoolConnection<sqlx::MySql>>>)>>,
     // Shared with the MCP server task so allowlist edits take effect live
     // without restarting Squire. Empty Vec means "allow all".
     mcp_allowed_conns: Arc<RwLock<Vec<i64>>>,
@@ -195,6 +206,7 @@ async fn save_connection(
 #[tauri::command]
 async fn delete_connection(state: State<'_, AppState>, id: i64) -> Result<(), String> {
     // Close active pools first (MySQL, SQLite, Milvus, Redis)
+    drop_txns_for_connection(&state, id).await;
     if let Some(pool) = state.active_pools.lock().await.remove(&id) {
         pool.close().await;
     }
@@ -319,6 +331,7 @@ async fn open_connection(state: State<'_, AppState>, id: i64) -> Result<(), Stri
 
 #[tauri::command]
 async fn close_connection(state: State<'_, AppState>, id: i64) -> Result<(), String> {
+    drop_txns_for_connection(&state, id).await;
     if let Some(pool) = state.active_pools.lock().await.remove(&id) {
         pool.close().await;
     }
@@ -328,6 +341,23 @@ async fn close_connection(state: State<'_, AppState>, id: i64) -> Result<(), Str
     state.active_milvus.lock().await.remove(&id);
     state.active_redis.lock().await.remove(&id);
     Ok(())
+}
+
+/// Drop (roll back implicitly, by dropping the connection) any manual
+/// transactions bound to `id`. Called before closing a connection's pool so
+/// held connections are released and `pool.close()` doesn't block on them.
+async fn drop_txns_for_connection(state: &AppState, id: i64) {
+    let mut txns = state.active_txns.lock().await;
+    let stale: Vec<String> = txns
+        .iter()
+        .filter(|(_, (cid, _))| *cid == id)
+        .map(|(k, _)| k.clone())
+        .collect();
+    for k in stale {
+        // Dropping the PoolConnection returns it to the pool; the open
+        // transaction is rolled back by the server when the session ends.
+        txns.remove(&k);
+    }
 }
 
 // ============================================================================
@@ -492,6 +522,7 @@ async fn execute_query(
     sql: String,
     query_token: Option<String>,
     database: Option<String>,
+    txn_id: Option<String>,
 ) -> Result<QueryResult, String> {
     if is_sqlite(&state, id).await {
         let pool = get_sqlite_pool(&state, id).await?;
@@ -532,6 +563,35 @@ async fn execute_query(
         .get(&id)
         .cloned()
         .ok_or_else(|| "Connection not open. Click 'Open' first.".to_string())?;
+
+    // Manual transaction: when this tab has an active transaction, every
+    // statement must run on the held connection (so BEGIN's isolation and
+    // uncommitted writes are visible). We clone the Arc, releasing the map lock
+    // before running, so a slow query doesn't block begin/finish on other tabs.
+    if let Some(tid) = txn_id.as_ref() {
+        let holder = state.active_txns.lock().await.get(tid).map(|h| h.1.clone());
+        if let Some(holder) = holder {
+            let mut conn = holder.lock().await;
+            let result = query::execute_on_conn(&mut conn, &sql).await;
+            let _ = storage::history::insert(
+                &state.sqlite,
+                id,
+                &sql,
+                result.as_ref().ok().map(|qr| qr.elapsed_ms as i64),
+                result.as_ref().ok().and_then(|qr| qr.rows_affected.map(|n| n as i64)),
+                result.as_ref().ok().map(|qr| qr.rows.len() as i64),
+                result.as_ref().err().map(|e| e.to_string()).as_deref(),
+            )
+            .await;
+            let mut qr = result.map_err(|e| format!("query failed: {e}"))?;
+            if !qr.columns.is_empty() {
+                qr.editable = query::resolve_editable(&pool, &sql, &qr.columns).await;
+            }
+            return Ok(qr);
+        }
+        // txn_id passed but not active (e.g. after commit) — fall through to the
+        // normal pool path.
+    }
 
     // When the caller picks a database for this query, we acquire a conn,
     // run `USE` on it via the text protocol (raw_sql), then run the user SQL.
@@ -618,6 +678,69 @@ async fn execute_query(
         qr.editable = query::resolve_editable(&pool, &sql, &qr.columns).await;
     }
     Ok(qr)
+}
+
+/// Begin a manual transaction bound to `txn_id` (the frontend tab id). Acquires
+/// one pooled connection, runs BEGIN on it, and holds it out of the pool until
+/// commit / rollback. Errors if a transaction is already active for this id.
+/// MySQL only — transactions on the shared pool would land on arbitrary
+/// physical connections, so a single held connection is mandatory.
+#[tauri::command]
+async fn begin_transaction(
+    state: State<'_, AppState>,
+    id: i64,
+    txn_id: String,
+) -> Result<(), String> {
+    {
+        let txns = state.active_txns.lock().await;
+        if txns.contains_key(&txn_id) {
+            return Err("A transaction is already active for this tab.".to_string());
+        }
+    }
+    let pool = state
+        .active_pools
+        .lock()
+        .await
+        .get(&id)
+        .cloned()
+        .ok_or_else(|| "Connection not open. Click 'Open' first.".to_string())?;
+    let mut conn = pool
+        .acquire()
+        .await
+        .map_err(|e| format!("acquire connection failed: {e}"))?;
+    query::execute_on_conn(&mut conn, "BEGIN")
+        .await
+        .map_err(|e| format!("BEGIN failed: {e}"))?;
+    state
+        .active_txns
+        .lock()
+        .await
+        .insert(txn_id, (id, Arc::new(Mutex::new(conn))));
+    Ok(())
+}
+
+/// Finish a manual transaction: `commit` = true runs COMMIT, false runs
+/// ROLLBACK. Removes the held connection so it returns to the pool. No-op error
+/// if the transaction isn't active (already finished / never began).
+#[tauri::command]
+async fn finish_transaction(
+    state: State<'_, AppState>,
+    txn_id: String,
+    commit: bool,
+) -> Result<(), String> {
+    let holder = state
+        .active_txns
+        .lock()
+        .await
+        .remove(&txn_id)
+        .ok_or_else(|| "No active transaction for this tab.".to_string())?;
+    let mut conn = holder.1.lock().await;
+    let stmt = if commit { "COMMIT" } else { "ROLLBACK" };
+    query::execute_on_conn(&mut conn, stmt)
+        .await
+        .map_err(|e| format!("{stmt} failed: {e}"))?;
+    // `conn` (and the Arc) drop here, returning the connection to the pool.
+    Ok(())
 }
 
 #[tauri::command]
@@ -4502,6 +4625,79 @@ async fn generate_create_sql(spec: ddl::TableStructure) -> Result<String, String
 }
 
 #[tauri::command]
+async fn list_db_objects(
+    state: State<'_, AppState>,
+    connection_id: i64,
+    database: String,
+    kind: String,
+) -> Result<Vec<objects::DbObject>, String> {
+    let pool = state
+        .active_pools
+        .lock()
+        .await
+        .get(&connection_id)
+        .cloned()
+        .ok_or_else(|| "Connection not open".to_string())?;
+    objects::list_objects(&pool, &database, &kind).await
+}
+
+#[tauri::command]
+async fn show_object_ddl(
+    state: State<'_, AppState>,
+    connection_id: i64,
+    database: String,
+    kind: String,
+    name: String,
+) -> Result<String, String> {
+    let pool = state
+        .active_pools
+        .lock()
+        .await
+        .get(&connection_id)
+        .cloned()
+        .ok_or_else(|| "Connection not open".to_string())?;
+    objects::show_object_ddl(&pool, &database, &kind, &name).await
+}
+
+#[tauri::command]
+async fn list_db_users(
+    state: State<'_, AppState>,
+    connection_id: i64,
+) -> Result<Vec<users::DbUser>, String> {
+    let pool = state
+        .active_pools
+        .lock()
+        .await
+        .get(&connection_id)
+        .cloned()
+        .ok_or_else(|| "Connection not open".to_string())?;
+    users::list_users(&pool).await
+}
+
+/// Preview the SQL a user action will run, without executing it. Powers the
+/// confirmation dialog.
+#[tauri::command]
+async fn preview_user_action(action: users::UserAction) -> Result<String, String> {
+    users::action_sql(&action)
+}
+
+#[tauri::command]
+async fn apply_user_action(
+    state: State<'_, AppState>,
+    connection_id: i64,
+    action: users::UserAction,
+) -> Result<String, String> {
+    let pool = state
+        .active_pools
+        .lock()
+        .await
+        .get(&connection_id)
+        .cloned()
+        .ok_or_else(|| "Connection not open".to_string())?;
+    users::apply_user_action(&pool, &action).await
+}
+
+#[tauri::command]
 async fn dump_database_schema(
     state: State<'_, AppState>,
     connection_id: i64,
@@ -4805,6 +5001,7 @@ pub fn run() {
                 active_sqlite: Mutex::new(HashMap::new()),
                 active_redis: Mutex::new(HashMap::new()),
                 running_queries: Arc::new(Mutex::new(HashMap::new())),
+                active_txns: Mutex::new(HashMap::new()),
                 mcp_allowed_conns,
             });
             Ok(())
@@ -4825,6 +5022,8 @@ pub fn run() {
             close_connection,
             execute_query,
             cancel_query,
+            begin_transaction,
+            finish_transaction,
             update_cell,
             insert_row,
             delete_rows,
@@ -4920,6 +5119,11 @@ pub fn run() {
             get_table_structure,
             generate_alter_sql,
             generate_create_sql,
+            list_db_objects,
+            show_object_ddl,
+            list_db_users,
+            preview_user_action,
+            apply_user_action,
             dump_database_schema,
             save_query,
             list_saved_queries,

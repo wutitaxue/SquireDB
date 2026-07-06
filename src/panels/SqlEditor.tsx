@@ -5,6 +5,28 @@ import { EditorView, keymap } from "@codemirror/view";
 import { HighlightStyle, syntaxHighlighting } from "@codemirror/language";
 import type { CompletionContext, CompletionResult, CompletionSource } from "@codemirror/autocomplete";
 import { tags as t } from "@lezer/highlight";
+import { formatSql } from "../formatSql";
+
+/** Reformat the current selection (if any) or the whole document in place,
+ *  dispatched as a single edit so it's a single undo step. Returns true so it
+ *  can be used directly as a keymap `run` handler. */
+export function runFormat(view: EditorView): boolean {
+  const { from, to } = view.state.selection.main;
+  if (from !== to) {
+    const formatted = formatSql(view.state.sliceDoc(from, to));
+    view.dispatch({
+      changes: { from, to, insert: formatted },
+      selection: { anchor: from, head: from + formatted.length },
+    });
+  } else {
+    const doc = view.state.doc.toString();
+    const formatted = formatSql(doc);
+    if (formatted !== doc) {
+      view.dispatch({ changes: { from: 0, to: doc.length, insert: formatted } });
+    }
+  }
+  return true;
+}
 
 // Keywords that can legally follow a table reference — used to avoid mistaking
 // them for a table alias (e.g. `FROM users WHERE ...` — `WHERE` is not an alias).
@@ -261,6 +283,11 @@ export function SqlEditor({ value, onChange, onRun, editorRef, readOnly, schema 
             onRunRef.current(selected);
             return true;
           },
+        },
+        {
+          key: "Mod-Shift-f",
+          preventDefault: true,
+          run: runFormat,
         },
       ]),
       EditorView.lineWrapping,

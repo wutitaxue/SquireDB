@@ -14,6 +14,7 @@ import type {
   QueryResult,
 } from "../types";
 import { copyText, isImeComposing, parseLookupValue, renderCell } from "../utils";
+import type { ColumnFilter, FilterOp } from "../sqlWhere";
 import {
   EXPORT_FORMAT_META,
   backtick,
@@ -91,6 +92,15 @@ type Props = {
   onClearSort?: () => void;
   /** Currently-injected sort, used to render the ▲/▼ indicator. */
   sort?: { column: string; dir: "asc" | "desc" } | null;
+
+  /** Server-side column filters keyed by column name (WHERE pushdown). When
+   *  provided the filter popover shows a "Filter in database" builder that
+   *  rewrites the SQL and reruns. Undefined disables it (e.g. GROUP BY / UNION
+   *  queries whose WHERE we can't safely rewrite, or non-SQL results). The
+   *  local value-picker below it is always available. */
+  dbFilters?: Record<string, ColumnFilter>;
+  onDbFilterChange?: (column: string, filter: ColumnFilter | null) => void;
+  onClearDbFilters?: () => void;
 
   /** Hidden column names (keyed by name, not index, so the set survives
    *  Run wiping the batch). Owned by QueryWorkspace per-tab. */
@@ -174,6 +184,9 @@ function ResultsPaneImpl(props: Props) {
     onSort,
     onClearSort,
     sort,
+    dbFilters,
+    onDbFilterChange,
+    onClearDbFilters,
   } = props;
 
   const [view, setView] = useState<ViewKind>("table");
@@ -609,6 +622,19 @@ function ResultsPaneImpl(props: Props) {
               <span className="text-warn">{rowLimitNotice}</span>
             </>
           )}
+          {dbFilters && Object.keys(dbFilters).length > 0 && onClearDbFilters && (
+            <>
+              <span className="text-border-2">·</span>
+              <button
+                onClick={onClearDbFilters}
+                title="Remove all database column filters and rerun"
+                className="text-acc hover:text-acc-2 font-medium"
+              >
+                {Object.keys(dbFilters).length} filter
+                {Object.keys(dbFilters).length > 1 ? "s" : ""} ✕
+              </button>
+            </>
+          )}
           {editable && (
             <>
               <span className="text-border-2">·</span>
@@ -889,6 +915,8 @@ function ResultsPaneImpl(props: Props) {
           onSort={onSort}
           onClearSort={onClearSort}
           sort={sort ?? null}
+          dbFilters={dbFilters}
+          onDbFilterChange={onDbFilterChange}
           hiddenCols={hiddenCols}
           columnWidths={columnWidths}
           onColumnWidthsChange={setColumnWidths}
@@ -999,6 +1027,8 @@ function TableView({
   onSort,
   onClearSort,
   sort,
+  dbFilters,
+  onDbFilterChange,
   hiddenCols,
   columnWidths,
   onColumnWidthsChange,
@@ -1017,6 +1047,8 @@ function TableView({
   onSort?: (columnName: string, dir: "asc" | "desc") => void;
   onClearSort?: () => void;
   sort: { column: string; dir: "asc" | "desc" } | null;
+  dbFilters?: Record<string, ColumnFilter>;
+  onDbFilterChange?: (column: string, filter: ColumnFilter | null) => void;
   hiddenCols: Set<string>;
   columnWidths: Record<string, number>;
   onColumnWidthsChange: (next: Record<string, number>) => void;
@@ -1319,7 +1351,8 @@ function TableView({
             const sorted = sort?.column === c.name ? sort.dir : null;
             const sortable = !!onSort;
             const filterSet = filters[j];
-            const hasFilter = !!filterSet && filterSet.size > 0;
+            const hasDbFilter = !!dbFilters && !!dbFilters[c.name];
+            const hasFilter = (!!filterSet && filterSet.size > 0) || hasDbFilter;
             const isActive = activeCol === j;
             // The name (+ PK icon) and both action buttons always stay visible
             // (the resize floor guarantees room for them). Only the type label
@@ -1403,7 +1436,13 @@ function TableView({
                       });
                     }
                   }}
-                  title={hasFilter ? `Filter: ${filterSet!.size} value(s) selected` : "Filter this column"}
+                  title={
+                    hasDbFilter
+                      ? `DB filter: ${dbFilters![c.name].op} ${dbFilters![c.name].value}`.trim()
+                      : filterSet && filterSet.size > 0
+                        ? `Local filter: ${filterSet.size} value(s) selected`
+                        : "Filter this column"
+                  }
                   className={`w-5 h-5 flex items-center justify-center rounded hover:bg-bg shrink-0 ${
                     hasFilter ? "text-acc" : "text-subtle hover:text-ink-2"
                   }`}
@@ -1612,6 +1651,14 @@ function TableView({
             rows={result.rows}
             colIdx={openFilter.col}
             selected={filters[openFilter.col] ?? null}
+            dbFilter={
+              dbFilters ? dbFilters[result.columns[openFilter.col].name] ?? null : undefined
+            }
+            onDbFilterChange={
+              dbFilters && onDbFilterChange
+                ? (f) => onDbFilterChange(result.columns[openFilter.col].name, f)
+                : undefined
+            }
             onChange={(next) =>
               setFilters((prev) => {
                 const copy = { ...prev };
@@ -1644,14 +1691,63 @@ type FilterPopoverProps = {
   onClose: () => void;
   anchorRight: number;
   anchorBottom: number;
+  /** Current server-side WHERE filter for this column (undefined = DB filter
+   *  not available for this query; null = available but unset). */
+  dbFilter?: ColumnFilter | null;
+  onDbFilterChange?: (filter: ColumnFilter | null) => void;
 };
+
+const FILTER_OPS: FilterOp[] = [
+  "=",
+  "!=",
+  ">",
+  ">=",
+  "<",
+  "<=",
+  "LIKE",
+  "NOT LIKE",
+  "IN",
+  "IS NULL",
+  "IS NOT NULL",
+];
+
+/** Ops that don't take a value input. */
+const NULLARY_OPS = new Set<FilterOp>(["IS NULL", "IS NOT NULL"]);
 
 const FilterPopover = forwardRef<HTMLDivElement, FilterPopoverProps>(
   function FilterPopover(
-    { columnName, rows, colIdx, selected, onChange, onClose, anchorRight, anchorBottom },
+    {
+      columnName,
+      rows,
+      colIdx,
+      selected,
+      onChange,
+      onClose,
+      anchorRight,
+      anchorBottom,
+      dbFilter,
+      onDbFilterChange,
+    },
     ref,
   ) {
     const [search, setSearch] = useState("");
+    // Draft state for the DB WHERE builder. Seeded from the active dbFilter so
+    // reopening the popover shows the current condition.
+    const [op, setOp] = useState<FilterOp>(dbFilter?.op ?? "=");
+    const [filterValue, setFilterValue] = useState(dbFilter?.value ?? "");
+    const dbAvailable = dbFilter !== undefined && !!onDbFilterChange;
+
+    function applyDb() {
+      if (!onDbFilterChange) return;
+      onDbFilterChange({ op, value: NULLARY_OPS.has(op) ? "" : filterValue });
+      onClose();
+    }
+    function clearDb() {
+      if (!onDbFilterChange) return;
+      setOp("=");
+      setFilterValue("");
+      onDbFilterChange(null);
+    }
 
     // Per-column distinct values + frequencies. Capped at FILTER_DISTINCT_CAP;
     // beyond that the popover degrades to a notice (filtering still works on
@@ -1717,7 +1813,7 @@ const FilterPopover = forwardRef<HTMLDivElement, FilterPopoverProps>(
     }
 
     const W = 280;
-    const H = 360;
+    const H = dbAvailable ? 460 : 360;
     const PAD = 8;
     const vw = typeof window !== "undefined" ? window.innerWidth : 1280;
     const vh = typeof window !== "undefined" ? window.innerHeight : 800;
@@ -1730,6 +1826,58 @@ const FilterPopover = forwardRef<HTMLDivElement, FilterPopoverProps>(
         className="fixed z-50 bg-panel border border-border rounded-md shadow-3 overflow-hidden flex flex-col"
         style={{ left, top, width: W, maxHeight: H }}
       >
+        {dbAvailable && (
+          <div className="px-3 py-2 border-b border-border shrink-0 bg-panel-2">
+            <div className="text-[10px] uppercase tracking-wider font-bold text-muted mb-1.5">
+              Filter in database
+            </div>
+            <div className="flex items-center gap-1.5">
+              <select
+                value={op}
+                onChange={(e) => setOp(e.target.value as FilterOp)}
+                className="h-7 px-1 text-[11px] bg-panel border border-border rounded text-ink outline-none focus:border-acc shrink-0"
+              >
+                {FILTER_OPS.map((o) => (
+                  <option key={o} value={o}>
+                    {o}
+                  </option>
+                ))}
+              </select>
+              {!NULLARY_OPS.has(op) && (
+                <input
+                  type="text"
+                  value={filterValue}
+                  onChange={(e) => setFilterValue(e.target.value)}
+                  onKeyDown={(e) => {
+                    if (e.key === "Enter") {
+                      e.preventDefault();
+                      applyDb();
+                    }
+                  }}
+                  placeholder={op === "IN" ? "a, b, c" : "value"}
+                  className="flex-1 min-w-0 h-7 px-2 text-[12px] bg-panel border border-border rounded outline-none focus:border-acc"
+                />
+              )}
+            </div>
+            <div className="flex items-center gap-1.5 mt-1.5">
+              <button
+                onClick={applyDb}
+                className="h-6 px-2.5 text-[11px] font-semibold text-white bg-acc rounded hover:bg-acc-2"
+              >
+                Apply (rerun)
+              </button>
+              {dbFilter && (
+                <button
+                  onClick={clearDb}
+                  className="h-6 px-2.5 text-[11px] text-ink-2 bg-panel border border-border rounded hover:bg-bg"
+                >
+                  Clear
+                </button>
+              )}
+              <span className="ml-auto text-[10px] text-subtle">rewrites WHERE</span>
+            </div>
+          </div>
+        )}
         <div className="px-3 py-2 border-b border-border text-[11px] text-ink-2 shrink-0">
           Local Filter For{" "}
           <span className="font-mono text-acc-ink">'{columnName}'</span>
@@ -1741,7 +1889,7 @@ const FilterPopover = forwardRef<HTMLDivElement, FilterPopoverProps>(
               🔍
             </span>
             <input
-              autoFocus
+              autoFocus={!dbAvailable}
               type="text"
               value={search}
               onChange={(e) => setSearch(e.target.value)}

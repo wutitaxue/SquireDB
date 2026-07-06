@@ -9,6 +9,7 @@ export type AgentId =
   | "dictionary"
   | "er-diagram"
   | "deadlock"
+  | "users"
   | "repair";
 
 export type QueryTab = {
@@ -196,6 +197,12 @@ export const AGENT_META: Record<
     sub: "Parse · AI root cause",
     icon: "🔒",
     pill: { text: "DBA", tone: "crit" },
+  },
+  users: {
+    name: "Users & Privileges",
+    sub: "Accounts · grants",
+    icon: "👤",
+    pill: { text: "writes", tone: "crit" },
   },
   repair: {
     name: "Data Repair",

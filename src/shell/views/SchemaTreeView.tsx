@@ -1,9 +1,24 @@
 import { useMemo } from "react";
-import { SYSTEM_DBS, type ColumnMetaForTree, type TableMetaForTree } from "../../types";
+import {
+  SYSTEM_DBS,
+  type ColumnMetaForTree,
+  type DbObject,
+  type DbObjectKind,
+  type TableMetaForTree,
+} from "../../types";
 import { fmtCount } from "../../utils";
 import { TreeGroupRow } from "../atoms/TreeGroupRow";
 
 export type SchemaFilter = "pii" | "fk" | "indexed";
+
+/** Object-group definitions rendered under each db node, in display order.
+ *  Views are excluded — they arrive as tables (kind="view"). */
+const OBJECT_GROUPS: Array<{ kind: DbObjectKind; label: string; icon: string }> = [
+  { kind: "procedure", label: "Procedures", icon: "ƒ" },
+  { kind: "function", label: "Functions", icon: "λ" },
+  { kind: "trigger", label: "Triggers", icon: "⚡" },
+  { kind: "event", label: "Events", icon: "◷" },
+];
 
 type Props = {
   databases: string[];
@@ -13,6 +28,13 @@ type Props = {
   columnsByTableKey: Record<string, ColumnMetaForTree[]>;
   expandedDbs: Set<string>;
   expandedTables: Set<string>;
+
+  /** Non-table objects keyed by `${db}::${kind}`. Undefined (not just empty)
+   *  for non-MySQL connections, which suppresses the object groups entirely. */
+  objectsByKey?: Record<string, DbObject[]>;
+  expandedObjectGroups?: Set<string>;
+  onToggleObjectGroup?: (db: string, kind: DbObjectKind) => void;
+  onClickObject?: (db: string, kind: DbObjectKind, name: string) => void;
 
   piiTables: Set<string>;
   piiColumns: Set<string>;
@@ -73,6 +95,10 @@ export function SchemaTreeView({
   columnsByTableKey,
   expandedDbs,
   expandedTables,
+  objectsByKey,
+  expandedObjectGroups,
+  onToggleObjectGroup,
+  onClickObject,
   piiTables,
   piiColumns,
   selectedKey,
@@ -305,6 +331,58 @@ export function SchemaTreeView({
                               </li>
                             );
                           })}
+                        </ul>
+                      )}
+                    </li>
+                  );
+                })}
+              </ul>
+            )}
+            {expanded && objectsByKey && !isSystem && !filterActive && (
+              <ul className="ml-[12px]">
+                {OBJECT_GROUPS.map((g) => {
+                  const gkey = `${db}::${g.kind}`;
+                  const objs = objectsByKey[gkey];
+                  const groupExpanded = expandedObjectGroups?.has(gkey) ?? false;
+                  return (
+                    <li key={g.kind}>
+                      <TreeGroupRow
+                        expanded={groupExpanded}
+                        onClick={() => onToggleObjectGroup?.(db, g.kind)}
+                        label={g.label}
+                        muted
+                        trailing={
+                          objs ? (
+                            <span className="text-[10px] text-subtle font-mono shrink-0">
+                              {objs.length}
+                            </span>
+                          ) : undefined
+                        }
+                      />
+                      {groupExpanded && objs && (
+                        <ul className="ml-[28px]">
+                          {objs.length === 0 && (
+                            <li className="pl-2 py-0.5 text-[11px] text-subtle italic">
+                              (none)
+                            </li>
+                          )}
+                          {objs.map((o) => (
+                            <li key={o.name}>
+                              <button
+                                onClick={() => onClickObject?.(db, g.kind, o.name)}
+                                title={o.detail || o.name}
+                                className="w-full flex items-center gap-1.5 h-[22px] pl-2 pr-1 rounded text-[11px] min-w-0 hover:bg-bg"
+                              >
+                                <span className="text-subtle text-[10px] shrink-0">{g.icon}</span>
+                                <span className="text-ink-2 truncate">{o.name}</span>
+                                {o.detail && (
+                                  <span className="ml-auto text-[10px] text-subtle truncate max-w-[110px] shrink-0">
+                                    {o.detail}
+                                  </span>
+                                )}
+                              </button>
+                            </li>
+                          ))}
                         </ul>
                       )}
                     </li>

@@ -45,6 +45,15 @@ export type ColumnMetaForTree = {
   nullable: boolean;
 };
 
+/** Non-table schema objects surfaced in the tree under per-type groups.
+ *  Views are excluded — they arrive via list_table_meta (kind="view"). */
+export type DbObjectKind = "procedure" | "function" | "trigger" | "event";
+
+export type DbObject = {
+  name: string;
+  detail: string;
+};
+
 export type EditTarget = {
   schema: string;
   table: string;
@@ -1502,3 +1511,23 @@ export type SyncPullPreview = {
   conflict_report: ConflictReport;
   snapshot: SyncSnapshot;
 };
+
+/** A MySQL account + its grants, for the Users & Privileges GUI. */
+export type DbUser = {
+  user: string;
+  host: string;
+  locked: boolean | null;
+  grants: string[];
+  grants_error: string | null;
+};
+
+/** Structured user-management request. Mirrors the Rust UserAction enum
+ *  (serde tag = "kind", snake_case). Composed into SQL server-side. */
+export type UserAction =
+  | { kind: "create_user"; user: string; host: string; password: string }
+  | { kind: "set_password"; user: string; host: string; password: string }
+  | { kind: "drop_user"; user: string; host: string }
+  | { kind: "set_lock"; user: string; host: string; locked: boolean }
+  | { kind: "grant"; user: string; host: string; privileges: string; scope: string }
+  | { kind: "revoke"; user: string; host: string; privileges: string; scope: string };
+
