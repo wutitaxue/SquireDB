@@ -46,7 +46,7 @@ struct AppState {
     sqlite: SqlitePool,
     active_pools: Arc<Mutex<HashMap<i64, MySqlPool>>>,
     active_milvus: Mutex<HashMap<i64, milvus::MilvusClient>>,
-    active_sqlite: Mutex<HashMap<i64, SqlitePool>>,
+    active_sqlite: Arc<Mutex<HashMap<i64, SqlitePool>>>,
     active_redis: Mutex<HashMap<i64, redis::aio::ConnectionManager>>,
     // query_token -> (connection_id, mysql_thread_id) for in-flight queries
     running_queries: Arc<Mutex<HashMap<String, (i64, u64)>>>,
@@ -4952,6 +4952,7 @@ pub fn run() {
             }
 
             let active_pools = Arc::new(Mutex::new(HashMap::<i64, MySqlPool>::new()));
+            let active_sqlite = Arc::new(Mutex::new(HashMap::<i64, SqlitePool>::new()));
 
             // Seed allowlist from SQLite on boot so the Tauri command and the
             // MCP server start in sync. Shared Arc lets later edits propagate
@@ -4966,6 +4967,7 @@ pub fn run() {
             // Boot MCP server if enabled. Token is seeded on first run.
             let mcp_sqlite = pool.clone();
             let mcp_pools = active_pools.clone();
+            let mcp_sqlite_pools = active_sqlite.clone();
             let mcp_allowed_for_server = mcp_allowed_conns.clone();
             let bind_port = initial_settings.bind_port;
             let enabled = initial_settings.enabled;
@@ -4986,6 +4988,7 @@ pub fn run() {
                     token,
                     mcp_sqlite,
                     mcp_pools,
+                    mcp_sqlite_pools,
                     mcp_allowed_for_server,
                 )
                 .await
@@ -4998,7 +5001,7 @@ pub fn run() {
                 sqlite: pool,
                 active_pools,
                 active_milvus: Mutex::new(HashMap::new()),
-                active_sqlite: Mutex::new(HashMap::new()),
+                active_sqlite: active_sqlite.clone(),
                 active_redis: Mutex::new(HashMap::new()),
                 running_queries: Arc::new(Mutex::new(HashMap::new())),
                 active_txns: Mutex::new(HashMap::new()),

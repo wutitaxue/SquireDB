@@ -884,7 +884,14 @@ function McpForm({ onClose }: { onClose: () => void }) {
       setToken(t);
       setPortInput(String(s.bindPort));
       setWrites(s.writeDatabases);
-      setConnections(conns.filter((c) => (c.kind ?? "mysql") === "mysql"));
+      // MySQL and SQLite connections can be exposed over MCP (allowlist +
+      // per-database write grants). Other kinds (Milvus / Redis) aren't served.
+      setConnections(
+        conns.filter((c) => {
+          const k = c.kind ?? "mysql";
+          return k === "mysql" || k === "sqlite";
+        }),
+      );
       // Preload database lists for connections already used in grants.
       for (const id of new Set(s.writeDatabases.map((w) => w.connectionId))) {
         void loadDbs(id);

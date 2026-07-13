@@ -20,6 +20,7 @@ use sqlx::{MySqlPool, SqlitePool};
 use tokio::sync::{Mutex, RwLock};
 
 use crate::query;
+use crate::sqlite_query;
 use crate::storage;
 
 mod protocol;
@@ -33,6 +34,9 @@ struct ServerCtx {
     token: Arc<String>,
     sqlite: SqlitePool,
     pools: Arc<Mutex<HashMap<i64, MySqlPool>>>,
+    // User SQLite connections (kind == "sqlite"). Distinct from `sqlite` above,
+    // which is Squire's own metadata database.
+    sqlite_pools: Arc<Mutex<HashMap<i64, SqlitePool>>>,
     // Shared with the Tauri side so set_mcp_allowed_conns takes effect live.
     allowed_conn_ids: Arc<RwLock<Vec<i64>>>, // empty = allow all
 }
@@ -42,12 +46,14 @@ pub async fn serve(
     token: String,
     sqlite: SqlitePool,
     pools: Arc<Mutex<HashMap<i64, MySqlPool>>>,
+    sqlite_pools: Arc<Mutex<HashMap<i64, SqlitePool>>>,
     allowed_conn_ids: Arc<RwLock<Vec<i64>>>,
 ) -> Result<(), std::io::Error> {
     let ctx = ServerCtx {
         token: Arc::new(token),
         sqlite,
         pools,
+        sqlite_pools,
         allowed_conn_ids,
     };
 
@@ -187,7 +193,7 @@ fn tool_list() -> Vec<Tool> {
     vec![
         Tool {
             name: "list_connections",
-            description: "List MySQL connections registered in Squire. Returns id, name, host, port, default database. Closed connections are also listed but cannot be queried until opened.",
+            description: "List MySQL and SQLite connections registered in Squire. Returns id, name, kind (mysql|sqlite), host, port, default database. Closed connections are also listed but cannot be queried until opened.",
             input_schema: json!({
                 "type": "object",
                 "properties": {},
@@ -196,7 +202,7 @@ fn tool_list() -> Vec<Tool> {
         },
         Tool {
             name: "list_databases",
-            description: "List databases on a connection. Connection must be open (the user must have unlocked it in Squire).",
+            description: "List databases on a connection. Connection must be open (the user must have unlocked it in Squire). SQLite connections have a single schema and always return [\"main\"].",
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -208,7 +214,7 @@ fn tool_list() -> Vec<Tool> {
         },
         Tool {
             name: "describe_table",
-            description: "Describe a table: columns (name, type, nullable, default, key), indexes, and PII / AI semantic annotations Squire has gathered.",
+            description: "Describe a table: columns (name, type, nullable, default, key), indexes, and PII / AI semantic annotations Squire has gathered. For SQLite connections, pass database \"main\" (columns/indexes come from PRAGMA).",
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -235,7 +241,7 @@ fn tool_list() -> Vec<Tool> {
         },
         Tool {
             name: "execute",
-            description: "Run a single write statement (INSERT / UPDATE / DELETE) that MODIFIES data. Disabled by default: the user must turn off global read-only AND grant the specific (connection, database, operation) in Squire → Settings → MCP. The `database` argument names the target database and must be granted for the statement's operation. Only one statement is allowed; the target table may not be qualified to a different database. Returns rows_affected.",
+            description: "Run a single write statement (INSERT / UPDATE / DELETE) that MODIFIES data. Disabled by default: the user must turn off global read-only AND grant the specific (connection, database, operation) in Squire → Settings → MCP. The `database` argument names the target database and must be granted for the statement's operation. Only one statement is allowed; the target table may not be qualified to a different database. For SQLite connections use database \"main\". Returns rows_affected.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -287,6 +293,30 @@ async fn pool_for(ctx: &ServerCtx, id: i64) -> Result<MySqlPool, String> {
         .ok_or_else(|| format!("connection {id} is not open in Squire — ask the user to open it"))
 }
 
+/// Look up a user SQLite connection's pool, subject to the same allowlist.
+async fn sqlite_pool_for(ctx: &ServerCtx, id: i64) -> Result<SqlitePool, String> {
+    let snap = allowed_snapshot(ctx).await;
+    if !allow_in(&snap, id) {
+        return Err(format!(
+            "connection {id} is not on the MCP allowlist (configure in Squire → Settings → MCP)"
+        ));
+    }
+    let pools = ctx.sqlite_pools.lock().await;
+    pools
+        .get(&id)
+        .cloned()
+        .ok_or_else(|| format!("connection {id} is not open in Squire — ask the user to open it"))
+}
+
+/// Read a connection's kind ("mysql" / "sqlite" / …) from the metadata DB.
+/// Used to dispatch tools that behave differently per data source.
+async fn conn_kind(ctx: &ServerCtx, id: i64) -> Result<String, String> {
+    storage::connection::get_by_id(&ctx.sqlite, id)
+        .await
+        .map(|c| c.kind)
+        .map_err(|e| format!("connection {id} lookup failed: {e}"))
+}
+
 fn json_payload(value: Value) -> ToolCallResult {
     let text = serde_json::to_string_pretty(&value).unwrap_or_else(|_| value.to_string());
     ToolCallResult::text(text)
@@ -303,14 +333,15 @@ async fn tool_list_connections(ctx: &ServerCtx) -> ToolCallResult {
     };
 
     let open_ids: std::collections::HashSet<i64> = {
-        let pools = ctx.pools.lock().await;
-        pools.keys().copied().collect()
+        let mysql = ctx.pools.lock().await;
+        let sqlite = ctx.sqlite_pools.lock().await;
+        mysql.keys().copied().chain(sqlite.keys().copied()).collect()
     };
     let snap = allowed_snapshot(ctx).await;
 
     let items: Vec<Value> = conns
         .into_iter()
-        .filter(|c| c.kind == "mysql")
+        .filter(|c| c.kind == "mysql" || c.kind == "sqlite")
         .filter(|c| match c.id {
             Some(id) => allow_in(&snap, id),
             None => false,
@@ -320,6 +351,7 @@ async fn tool_list_connections(ctx: &ServerCtx) -> ToolCallResult {
             json!({
                 "id": id,
                 "name": c.name,
+                "kind": c.kind,
                 "host": c.host,
                 "port": c.port,
                 "default_database": c.database,
@@ -345,6 +377,18 @@ async fn tool_list_databases(ctx: &ServerCtx, args: Value) -> ToolCallResult {
         Ok(a) => a,
         Err(e) => return ToolCallResult::error(format!("bad arguments: {e}")),
     };
+
+    // SQLite has no multi-database concept — one file is one schema ("main").
+    match conn_kind(ctx, args.connection_id).await {
+        Ok(k) if k == "sqlite" => {
+            if let Err(e) = sqlite_pool_for(ctx, args.connection_id).await {
+                return ToolCallResult::error(e);
+            }
+            return json_payload(json!({ "databases": ["main"] }));
+        }
+        Ok(_) => {}
+        Err(e) => return ToolCallResult::error(e),
+    }
 
     let pool = match pool_for(ctx, args.connection_id).await {
         Ok(p) => p,
@@ -389,6 +433,43 @@ async fn tool_describe_table(ctx: &ServerCtx, args: Value) -> ToolCallResult {
 
     if !is_safe_ident(&args.database) || !is_safe_ident(&args.table) {
         return ToolCallResult::error("database / table must be a simple identifier");
+    }
+
+    // SQLite: describe via PRAGMA. Uses its own pool; no db qualifier.
+    match conn_kind(ctx, args.connection_id).await {
+        Ok(k) if k == "sqlite" => {
+            let pool = match sqlite_pool_for(ctx, args.connection_id).await {
+                Ok(p) => p,
+                Err(e) => return ToolCallResult::error(e),
+            };
+            let cols = sqlite_query::execute(
+                &pool,
+                &format!("PRAGMA table_info(`{}`)", args.table.replace('`', "``")),
+            )
+            .await;
+            let idx = sqlite_query::execute(
+                &pool,
+                &format!("PRAGMA index_list(`{}`)", args.table.replace('`', "``")),
+            )
+            .await;
+            let columns_json = match cols {
+                Ok(r) => rows_to_records(&r),
+                Err(e) => return ToolCallResult::error(format!("PRAGMA table_info failed: {e}")),
+            };
+            let indexes_json = match idx {
+                Ok(r) => rows_to_records(&r),
+                Err(e) => return ToolCallResult::error(format!("PRAGMA index_list failed: {e}")),
+            };
+            return json_payload(json!({
+                "database": "main",
+                "table": args.table,
+                "columns": columns_json,
+                "indexes": indexes_json,
+                "annotations": [],
+            }));
+        }
+        Ok(_) => {}
+        Err(e) => return ToolCallResult::error(e),
     }
 
     let pool = match pool_for(ctx, args.connection_id).await {
@@ -497,6 +578,32 @@ async fn tool_query(ctx: &ServerCtx, args: Value) -> ToolCallResult {
 
     let augmented = inject_limit(&sql, HARD_ROW_CAP, &first);
 
+    // SQLite reads run on the user SQLite pool.
+    match conn_kind(ctx, args.connection_id).await {
+        Ok(k) if k == "sqlite" => {
+            let pool = match sqlite_pool_for(ctx, args.connection_id).await {
+                Ok(p) => p,
+                Err(e) => return ToolCallResult::error(e),
+            };
+            let result = match sqlite_query::execute(&pool, &augmented).await {
+                Ok(r) => r,
+                Err(e) => return ToolCallResult::error(format!("query failed: {e}")),
+            };
+            let truncated = result.rows.len() >= HARD_ROW_CAP;
+            let records = rows_to_records(&result);
+            return json_payload(json!({
+                "columns": result.columns.iter().map(|c| json!({"name": c.name, "type": c.type_name})).collect::<Vec<_>>(),
+                "rows": records,
+                "row_count": result.rows.len(),
+                "elapsed_ms": result.elapsed_ms,
+                "truncated": truncated,
+                "effective_sql": augmented,
+            }));
+        }
+        Ok(_) => {}
+        Err(e) => return ToolCallResult::error(e),
+    }
+
     let pool = match pool_for(ctx, args.connection_id).await {
         Ok(p) => p,
         Err(e) => return ToolCallResult::error(e),
@@ -589,6 +696,31 @@ async fn tool_execute(ctx: &ServerCtx, args: Value) -> ToolCallResult {
             "{op} on {database} (connection {}) is not granted for MCP; the user must grant it in Squire → Settings → MCP",
             args.connection_id
         ));
+    }
+
+    // SQLite writes: run directly on the user SQLite pool. SQLite has no
+    // database qualifier / USE, so the cross-database guard doesn't apply; the
+    // grant is expected to name the database "main".
+    match conn_kind(ctx, args.connection_id).await {
+        Ok(k) if k == "sqlite" => {
+            let pool = match sqlite_pool_for(ctx, args.connection_id).await {
+                Ok(p) => p,
+                Err(e) => return ToolCallResult::error(e),
+            };
+            let result = match sqlite_query::execute(&pool, &sql).await {
+                Ok(r) => r,
+                Err(e) => return ToolCallResult::error(format!("execute failed: {e}")),
+            };
+            return json_payload(json!({
+                "operation": op,
+                "database": database,
+                "rows_affected": result.rows_affected.unwrap_or(0),
+                "elapsed_ms": result.elapsed_ms,
+                "executed_sql": sql,
+            }));
+        }
+        Ok(_) => {}
+        Err(e) => return ToolCallResult::error(e),
     }
 
     // Cross-database guard: the primary write target may not be qualified to a

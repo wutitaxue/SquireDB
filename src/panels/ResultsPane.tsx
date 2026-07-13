@@ -1132,7 +1132,29 @@ function TableView({
   function commitEdit() {
     if (!editing) return;
     const { row, col } = editing;
-    const next = parseLookupValue(draft);
+    const original = result.rows[row][col];
+    // If the draft text is identical to how the original value renders in the
+    // editor, treat this as a no-op — entering and leaving a cell without
+    // typing must never mark it dirty. Without this guard, parseLookupValue can
+    // change the value's *type* (e.g. a VARCHAR holding "702112607133007"
+    // becomes the number 702112607133007), which then reads as an edit.
+    const originalText =
+      original === null
+        ? "null"
+        : typeof original === "string"
+          ? original
+          : typeof original === "object"
+            ? JSON.stringify(original)
+            : String(original);
+    if (draft === originalText) {
+      setEditing(null);
+      return;
+    }
+    // String-typed columns keep the raw text — don't coerce "123" to a number
+    // for a VARCHAR/CHAR/TEXT/ENUM column, only for genuinely numeric columns.
+    const typeName = (result.columns[col]?.type_name ?? "").toUpperCase();
+    const isStringCol = /CHAR|TEXT|ENUM|SET|BLOB|BINARY|JSON/.test(typeName);
+    const next = isStringCol && draft !== "null" ? draft : parseLookupValue(draft);
     setEditing(null);
     onRecordEdit(row, col, next);
   }

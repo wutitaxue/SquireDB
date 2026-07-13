@@ -23,13 +23,20 @@ SquireDB 围绕三件事打磨：
 ### 数据源
 
 - **MySQL** 5.7 / 8.0 — 连接池、加密存储、跨连接项目
+- **SQLite** — 本地文件库,复用同一套树 / 结果集 / 编辑器
+- **Redis** — key 浏览、TTL、控制台
 - **Milvus** 向量数据库 — 自然语言 → embedding → 向量检索
-- PostgreSQL · SQLite · ClickHouse · MongoDB · Redis 等正在规划中
+- PostgreSQL · ClickHouse · MongoDB 等正在规划中
 
 ### SQL 与数据操作
 
-- CodeMirror SQL 编辑器：schema-aware 补全、智能高亮、`Mod+Enter` 运行
+- CodeMirror SQL 编辑器：schema-aware 补全（识别当前 `FROM` 表优先补列）、SQL 格式化（`Mod+Shift+F`）、智能高亮、`Mod+Enter` 运行
 - 结果集：虚拟滚动、列宽调整、行编辑 / 插入 / 删除（识别 PK 后单表可写）
+- 免写 SQL 的列筛选器：表头一键构造 WHERE 下推数据库 + 本地值筛选并存
+- 手动事务：`Begin` / `Commit` / `Rollback`（绑定单连接，autocommit 关）
+- Schema 浏览：库 → 表 → 列,外加 视图 / 存储过程 / 函数 / 触发器 / 事件（点击看 DDL）
+- Table Designer：Columns / Indexes / Foreign Keys 可视化编辑 + DDL 预览 + AI 规范审查
+- 结果集 Copy as INSERT / UPDATE
 - 导出：CSV（RFC 4180）/ JSON / Markdown / SQL INSERT
 - JSON / 长文本单元格弹窗预览
 
@@ -54,6 +61,7 @@ SquireDB 围绕三件事打磨：
 - 体检报告导出：**HTML**（可打印 / Save as PDF）/ Markdown
 - ER 图自动生成（Mermaid，导出 `.mmd` / SVG / PNG）
 - 死锁分析（InnoDB STATUS 解析 + AI 根因）
+- 用户 / 权限管理：账户 + `SHOW GRANTS` 浏览，创建 / 授权 / 回收 / 改密 / 锁定 / 删除（写操作前预览 SQL,删除需确认）
 
 ### AI Agent（多步任务）
 
@@ -68,6 +76,15 @@ SquireDB 围绕三件事打磨：
 - **单击**表预览数据（注入 `SELECT * LIMIT 100`）
 - **双击**表展开关联钻取 —— 一次拿出客户的订单 / 退款 / 投诉 / 登录记录
 - Connection / Project 双工作台
+
+### MCP 服务器
+
+把 SquireDB 的连接暴露给外部 AI 客户端（Claude Desktop / Cursor 等），本地 `127.0.0.1` + Bearer token：
+
+- `list_connections` / `list_databases` / `describe_table` / `query`（只读）
+- `execute`（增删改）—— **默认关闭**，需关掉全局只读并按 (连接, 库, 操作) 逐项授权
+- MySQL 与 SQLite 连接均可暴露
+- 授权在 设置 → MCP 里管理,随改随生效
 
 ## Getting started
 
@@ -90,9 +107,10 @@ npm run tauri build        # 打包 release
 | 桌面框架 | Tauri 2 |
 | 后端语言 | Rust |
 | 前端 | React 19 + TypeScript |
-| 数据库驱动 | sqlx (MySQL) · Milvus client |
+| 数据库驱动 | sqlx (MySQL / SQLite) · redis-rs · Milvus client |
 | 本地存储 | SQLite (sqlx-sqlite) |
-| 编辑器 | CodeMirror 6 |
+| 编辑器 | CodeMirror 6 · sql-formatter |
+| 集成 | MCP 服务器（axum，暴露给外部 AI 客户端） |
 | 图表 | Recharts |
 | ER 图 | Mermaid |
 | AI | OpenAI / Claude / DeepSeek / Ollama / Azure OpenAI（自带 Key） |
@@ -100,8 +118,8 @@ npm run tauri build        # 打包 release
 
 ## What's next
 
-- 项目维度的 AI 简报 / 体检 / 影响分析 / Schema Diff
-- 自然语言数据问答
+- 自然语言数据问答 · 数据故事
+- 导入（`.sql` 脚本 / CSV）· 备份恢复
 - Web Server 模式 + 团队协作
 
 ## License
