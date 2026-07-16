@@ -59,6 +59,7 @@ type Props = {
   onEditProject: () => void;
   onStatsChange?: (stats: ProjectStats) => void;
   dockOpen: boolean;
+  onCloseDock?: () => void;
 
   /** Single-click on a project table — preview data in a query tab. */
   onTablePreview: (t: ProjectTable) => void;
@@ -109,6 +110,7 @@ export function ProjectShell({
   onEditProject,
   onStatsChange,
   dockOpen,
+  onCloseDock,
   onTablePreview,
   onTableDrill,
   onTableContextMenu,
@@ -651,6 +653,7 @@ export function ProjectShell({
           onOpenAgent={(id) => onOpenAgent(id as ProjectAgentId)}
           activity={activity}
           activityEmptyLabel="No recent drills."
+          onClose={onCloseDock}
         />
       )}
     </>

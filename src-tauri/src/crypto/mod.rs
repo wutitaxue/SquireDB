@@ -16,6 +16,7 @@ use sqlx::SqlitePool;
 const AI_KEY: &str = "ai:apikey";
 const EMBEDDING_KEY: &str = "embedding:apikey";
 const MCP_TOKEN: &str = "mcp:token";
+const SYNC_SECRET_KEY: &str = "sync:s3:secret_key";
 const HKDF_INFO: &[u8] = b"squiredb-v1-secret-store";
 const HKDF_SALT: &[u8] = b"squiredb-static-salt";
 
@@ -174,6 +175,18 @@ pub async fn get_mcp_token(pool: &SqlitePool) -> Result<String, String> {
 
 pub async fn set_mcp_token(pool: &SqlitePool, token: &str) -> Result<(), String> {
     put(pool, MCP_TOKEN, token).await
+}
+
+pub async fn set_sync_secret_key(pool: &SqlitePool, key: &str) -> Result<(), String> {
+    put(pool, SYNC_SECRET_KEY, key).await
+}
+
+pub async fn get_sync_secret_key(pool: &SqlitePool) -> Result<Option<String>, String> {
+    fetch(pool, SYNC_SECRET_KEY).await
+}
+
+pub async fn delete_sync_secret_key(pool: &SqlitePool) -> Result<(), String> {
+    drop_key(pool, SYNC_SECRET_KEY).await
 }
 
 pub async fn ensure_mcp_token(pool: &SqlitePool) -> Result<String, String> {

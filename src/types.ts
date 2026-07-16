@@ -45,6 +45,15 @@ export type ColumnMetaForTree = {
   nullable: boolean;
 };
 
+/** Non-table schema objects surfaced in the tree under per-type groups.
+ *  Views are excluded — they arrive via list_table_meta (kind="view"). */
+export type DbObjectKind = "procedure" | "function" | "trigger" | "event";
+
+export type DbObject = {
+  name: string;
+  detail: string;
+};
+
 export type EditTarget = {
   schema: string;
   table: string;
@@ -109,11 +118,18 @@ export type ActiveEmbeddingSummary = {
   model: string | null;
 };
 
+export type McpWriteDbPerm = {
+  connectionId: number;
+  database: string;
+  ops: string[]; // subset of "insert" | "update" | "delete"
+};
+
 export type McpStatus = {
   enabled: boolean;
   bindPort: number;
   readOnly: boolean;
   allowedConnIds: number[];
+  writeDatabases: McpWriteDbPerm[];
   running: boolean;
   actualPort: number;
   requiresRestart: boolean;
@@ -1365,3 +1381,153 @@ export type SavedQuery = {
   created_at: string;
   updated_at: string;
 };
+
+// ── Cloud sync (S3) ──
+
+export type SyncConfigDisplay = {
+  configured: boolean;
+  provider: string;
+  endpoint: string;
+  region: string;
+  bucket: string;
+  access_key: string;
+  has_secret_key: boolean;
+  path_style: boolean;
+  prefix: string;
+  device_name: string;
+  last_pushed_at: string | null;
+  last_pulled_at: string | null;
+  last_pulled_from: string | null;
+};
+
+export type SyncConfigInput = {
+  provider: string;
+  endpoint: string;
+  region: string;
+  bucket: string;
+  access_key: string;
+  secret_key: string | null;
+  path_style: boolean;
+  prefix: string;
+  device_name: string;
+};
+
+export type SyncDeviceObject = {
+  device_name: string;
+  key: string;
+  last_modified: string;
+  size: number;
+};
+
+export type SyncPushResult = {
+  device_name: string;
+  object_key: string;
+  bytes: number;
+  pushed_at: string;
+};
+
+export type BundleSummary = {
+  connections: number;
+  projects: number;
+  project_tables: number;
+  project_relations: number;
+  schema_relations: number;
+  saved_queries: number;
+  ai_models: number;
+  embedding_models: number;
+  mcp_settings: number;
+  settings: number;
+};
+
+export type BundleMeta = {
+  protocol_version: number;
+  db_schema_version: number;
+  device_name: string;
+  exported_at: string;
+  app_version: string;
+  summary: BundleSummary;
+};
+
+export type SyncEntryKind =
+  | "connection"
+  | "project"
+  | "project_table"
+  | "project_relation"
+  | "schema_relation"
+  | "saved_query"
+  | "ai_model"
+  | "embedding_model"
+  | "mcp_settings"
+  | "setting";
+
+export type SyncConflict = {
+  kind: SyncEntryKind;
+  local_key: string;
+  diff_lines: string[];
+  supports_rename: boolean;
+};
+
+export type AdditionCounts = {
+  connections: number;
+  projects: number;
+  project_tables: number;
+  project_relations: number;
+  schema_relations: number;
+  saved_queries: number;
+  ai_models: number;
+  embedding_models: number;
+  mcp_settings: number;
+  settings: number;
+};
+
+export type ConflictReport = {
+  additions: AdditionCounts;
+  conflicts: SyncConflict[];
+};
+
+export type SyncResolution =
+  | { type: "Overwrite" }
+  | { type: "KeepBothRename"; new_name: string }
+  | { type: "Skip" };
+
+export type ResolutionMap = {
+  entries: Record<string, SyncResolution>;
+};
+
+export type RestoreReport = {
+  inserted: Record<string, number>;
+  overwritten: Record<string, number>;
+  renamed: Record<string, number>;
+  skipped: Record<string, number>;
+  warnings: string[];
+};
+
+// Snapshot is passed back to the backend verbatim — frontend doesn't introspect it.
+export type SyncSnapshot = Record<string, unknown>;
+
+export type SyncPullPreview = {
+  device_name: string;
+  meta: BundleMeta;
+  conflict_report: ConflictReport;
+  snapshot: SyncSnapshot;
+};
+
+/** A MySQL account + its grants, for the Users & Privileges GUI. */
+export type DbUser = {
+  user: string;
+  host: string;
+  locked: boolean | null;
+  grants: string[];
+  grants_error: string | null;
+};
+
+/** Structured user-management request. Mirrors the Rust UserAction enum
+ *  (serde tag = "kind", snake_case). Composed into SQL server-side. */
+export type UserAction =
+  | { kind: "create_user"; user: string; host: string; password: string }
+  | { kind: "set_password"; user: string; host: string; password: string }
+  | { kind: "drop_user"; user: string; host: string }
+  | { kind: "set_lock"; user: string; host: string; locked: boolean }
+  | { kind: "grant"; user: string; host: string; privileges: string; scope: string }
+  | { kind: "revoke"; user: string; host: string; privileges: string; scope: string };
+

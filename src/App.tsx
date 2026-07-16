@@ -1,5 +1,6 @@
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { getVersion } from "@tauri-apps/api/app";
 import { save as saveDialog } from "@tauri-apps/plugin-dialog";
 import { writeTextFile } from "@tauri-apps/plugin-fs";
 import {
@@ -10,6 +11,8 @@ import {
   type Annotation,
   type ColumnMetaForTree,
   type Connection,
+  type DbObject,
+  type DbObjectKind,
   type HistoryEntry,
   type Injection,
   type Project,
@@ -37,6 +40,7 @@ import { InferRelationsWorkspace } from "./workspaces/InferRelationsWorkspace";
 import { RepairWorkspace } from "./workspaces/RepairWorkspace";
 import { ErDiagramWorkspace } from "./workspaces/ErDiagramWorkspace";
 import { DeadlockWorkspace } from "./workspaces/DeadlockWorkspace";
+import { UsersWorkspace } from "./workspaces/UsersWorkspace";
 import { MilvusSearchWorkspace } from "./workspaces/MilvusSearchWorkspace";
 import { TableDesignerWorkspace } from "./workspaces/TableDesignerWorkspace";
 import { DropTableModal } from "./panels/designer/DropTableModal";
@@ -56,6 +60,7 @@ import { SearchBar, type FilterChipDef } from "./shell/atoms/SearchBar";
 import { SchemaTreeView, type SchemaFilter } from "./shell/views/SchemaTreeView";
 import { ConnSecondary } from "./shell/views/ConnSecondary";
 import { Statusbar } from "./shell/Statusbar";
+import { useUpdater } from "./hooks/useUpdater";
 import {
   AGENT_META,
   agentTabId,
@@ -89,6 +94,11 @@ const INITIAL_INJECTION: Injection = Object.freeze({
 }) as Injection;
 
 function App() {
+  const updater = useUpdater();
+  const [appVersion, setAppVersion] = useState("");
+  useEffect(() => {
+    void getVersion().then(setAppVersion).catch(() => {});
+  }, []);
   const [connections, setConnections] = useState<Connection[]>([]);
   const [mode, setMode] = useState<AppMode>({ kind: "home" });
   const [editing, setEditing] = useState<Connection | null>(null);
@@ -104,6 +114,30 @@ function App() {
   >({});
   const [expandedDbs, setExpandedDbs] = useState<Set<string>>(new Set());
   const [expandedTables, setExpandedTables] = useState<Set<string>>(new Set());
+
+  // Non-table schema objects (procedures/functions/triggers/events), lazily
+  // loaded per (db, kind). Key = `${db}::${kind}`. Expanded groups drive both
+  // the fetch and the tree's disclosure state.
+  const [objectsByKey, setObjectsByKey] = useState<Record<string, DbObject[]>>({});
+  const [expandedObjectGroups, setExpandedObjectGroups] = useState<Set<string>>(new Set());
+
+  // Table → column-name map fed to the SQL editor's schema-aware completion.
+  // Built from whatever the schema tree has already loaded: every known table
+  // gets a bare-name entry (so table-name completion works immediately) plus a
+  // `db.table` entry, and columns fill in for tables the user has expanded.
+  // Memoized so the editor only reconfigures when tree data changes, not on
+  // every keystroke / re-render (QueryWorkspace is memoized on this identity).
+  const completionSchema = useMemo(() => {
+    const map: Record<string, string[]> = {};
+    for (const [db, tables] of Object.entries(tablesByDb)) {
+      for (const t of tables) {
+        const cols = (columnsByTableKey[`${db}.${t.name}`] ?? []).map((c) => c.name);
+        map[t.name] = cols;
+        map[`${db}.${t.name}`] = cols;
+      }
+    }
+    return map;
+  }, [tablesByDb, columnsByTableKey]);
   const [selectedKey, setSelectedKey] = useState<string | null>(null);
   const [showSystemDbs, setShowSystemDbs] = useState(false);
   const [schemaQuery, setSchemaQuery] = useState("");
@@ -221,6 +255,8 @@ function App() {
       setDatabases([]);
       setTablesByDb({});
       setColumnsByTableKey({});
+      setObjectsByKey({});
+      setExpandedObjectGroups(new Set());
       setExpandedDbs(new Set());
       setExpandedTables(new Set());
       setSelectedKey(null);
@@ -566,6 +602,66 @@ function App() {
       }
     }
     setExpandedTables(new Set([...expandedTables, key]));
+  }
+
+  /** Toggle a per-db object group (procedures/functions/triggers/events),
+   *  lazily fetching its members the first time it's opened. */
+  async function toggleObjectGroup(db: string, kind: DbObjectKind) {
+    if (workingId === null) return;
+    const key = `${db}::${kind}`;
+    if (expandedObjectGroups.has(key)) {
+      const next = new Set(expandedObjectGroups);
+      next.delete(key);
+      setExpandedObjectGroups(next);
+      return;
+    }
+    if (!objectsByKey[key]) {
+      try {
+        const list = await invoke<DbObject[]>("list_db_objects", {
+          connectionId: workingId,
+          database: db,
+          kind,
+        });
+        setObjectsByKey((prev) => ({ ...prev, [key]: list }));
+      } catch (err) {
+        setResult(String(err));
+        setIsError(true);
+        return;
+      }
+    }
+    setExpandedObjectGroups(new Set([...expandedObjectGroups, key]));
+  }
+
+  /** Fetch an object's DDL and drop it into a read-only query tab (no autorun —
+   *  it's a CREATE statement for viewing, not a query to run). */
+  async function openObjectDdl(db: string, kind: DbObjectKind, name: string) {
+    if (workingId === null) return;
+    let ddl: string;
+    try {
+      ddl = await invoke<string>("show_object_ddl", {
+        connectionId: workingId,
+        database: db,
+        kind,
+        name,
+      });
+    } catch (err) {
+      setResult(String(err));
+      setIsError(true);
+      return;
+    }
+    const stableId = `query:${wsKey}:${workingId}:${db}:${kind}:${name}`;
+    const alreadyOpen = tabs.some((x) => x.id === stableId);
+    if (!alreadyOpen) {
+      setTabs((prev) => {
+        if (prev.some((x) => x.id === stableId)) return prev;
+        return [...prev, { id: stableId, kind: "query", name, connectionId: workingId }];
+      });
+    }
+    setQueryInjections((prev) => {
+      const current = prev[stableId] ?? initialInjection;
+      return { ...prev, [stableId]: { sql: ddl, autorun: false, nonce: current.nonce + 1 } };
+    });
+    setActiveTabId(stableId);
   }
 
   /**
@@ -1336,6 +1432,7 @@ function App() {
     "schema-diff",
     "impact",
     "deadlock",
+    "users",
     "repair",
   ];
 
@@ -1546,6 +1643,14 @@ function App() {
               onClose={() => closeTab(activeTab.id)}
             />
           );
+        case "users":
+          return (
+            <UsersWorkspace
+              connectionId={working.id!}
+              databases={visibleDbs}
+              onClose={() => closeTab(activeTab.id)}
+            />
+          );
       }
     }
     return null;
@@ -1668,6 +1773,18 @@ function App() {
                   columnsByTableKey={columnsByTableKey}
                   expandedDbs={expandedDbs}
                   expandedTables={expandedTables}
+                  objectsByKey={working.kind === "mysql" ? objectsByKey : undefined}
+                  expandedObjectGroups={expandedObjectGroups}
+                  onToggleObjectGroup={
+                    working.kind === "mysql"
+                      ? (db, kind) => void toggleObjectGroup(db, kind)
+                      : undefined
+                  }
+                  onClickObject={
+                    working.kind === "mysql"
+                      ? (db, kind, name) => void openObjectDdl(db, kind, name)
+                      : undefined
+                  }
                   piiTables={piiTables}
                   piiColumns={piiColumns}
                   selectedKey={selectedKey}
@@ -1767,6 +1884,7 @@ function App() {
                         databases={databases}
                         database={tab.database}
                         onChangeDatabase={(next) => setTabDatabase(tab.id, next)}
+                        schema={completionSchema}
                       />
                     </div>
                   ))}
@@ -1798,6 +1916,7 @@ function App() {
                 onOpenAgent={(id) => openAgent(id as AgentId)}
                 insight={connInsight}
                 activity={connActivity}
+                onClose={() => setDockOpen(false)}
               />
             )}
           </>
@@ -1813,6 +1932,7 @@ function App() {
             onEditProject={() => setEditingProject(activeProject)}
             onStatsChange={setProjectStats}
             dockOpen={dockOpen}
+            onCloseDock={() => setDockOpen(false)}
             onTablePreview={(t) => void openProjectPreview(t)}
             onTableDrill={(t) => openProjectDrill(t)}
             onTableContextMenu={(e, t) => {
@@ -1852,6 +1972,11 @@ function App() {
         projectConnsTotal={projectStats.connsTotal}
         activeAiName={activeAiName}
         activeEmbeddingName={activeEmbeddingName}
+        version={appVersion}
+        updateAvailable={updater.available}
+        updateDownloading={updater.downloading}
+        updateProgress={updater.progress}
+        onUpdate={updater.install}
       />
 
       {showSettings && (

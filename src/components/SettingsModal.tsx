@@ -6,10 +6,12 @@ import type {
   EmbeddingModelView,
   EmbeddingProvider,
   McpStatus,
+  McpWriteDbPerm,
 } from "../types";
 import { copyText } from "../utils";
+import { SyncForm } from "./SyncForm";
 
-type TabKind = "chat" | "embedding" | "mcp";
+type TabKind = "chat" | "embedding" | "mcp" | "sync";
 
 export function SettingsModal({ onClose }: { onClose: () => void }) {
   const [tab, setTab] = useState<TabKind>("chat");
@@ -49,6 +51,9 @@ export function SettingsModal({ onClose }: { onClose: () => void }) {
           <TabButton active={tab === "mcp"} onClick={() => setTab("mcp")}>
             MCP Server
           </TabButton>
+          <TabButton active={tab === "sync"} onClick={() => setTab("sync")}>
+            Cloud Sync
+          </TabButton>
         </div>
 
         <div className="overflow-y-auto">
@@ -56,8 +61,10 @@ export function SettingsModal({ onClose }: { onClose: () => void }) {
             <ChatForm onClose={onClose} />
           ) : tab === "embedding" ? (
             <EmbeddingForm onClose={onClose} />
-          ) : (
+          ) : tab === "mcp" ? (
             <McpForm onClose={onClose} />
+          ) : (
+            <SyncForm onClose={onClose} />
           )}
         </div>
       </div>
@@ -856,6 +863,12 @@ function McpForm({ onClose }: { onClose: () => void }) {
   const [tokenVisible, setTokenVisible] = useState(false);
   const [connections, setConnections] = useState<Connection[]>([]);
   const [portInput, setPortInput] = useState("");
+  const [writes, setWrites] = useState<McpWriteDbPerm[]>([]);
+  // Per-connection database lists for the write-grant dropdowns. A connection
+  // that isn't open (or fails) maps to null → the row falls back to a text input.
+  const [dbsByConn, setDbsByConn] = useState<Record<number, string[] | null>>(
+    {},
+  );
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
   const [notice, setNotice] = useState("");
@@ -870,9 +883,42 @@ function McpForm({ onClose }: { onClose: () => void }) {
       setStatus(s);
       setToken(t);
       setPortInput(String(s.bindPort));
-      setConnections(conns.filter((c) => (c.kind ?? "mysql") === "mysql"));
+      setWrites(s.writeDatabases);
+      // MySQL and SQLite connections can be exposed over MCP (allowlist +
+      // per-database write grants). Other kinds (Milvus / Redis) aren't served.
+      setConnections(
+        conns.filter((c) => {
+          const k = c.kind ?? "mysql";
+          return k === "mysql" || k === "sqlite";
+        }),
+      );
+      // Preload database lists for connections already used in grants.
+      for (const id of new Set(s.writeDatabases.map((w) => w.connectionId))) {
+        void loadDbs(id);
+      }
     } catch (e) {
       setError(String(e));
+    }
+  }
+
+  // Fetch the database list for a connection (once). Stores null when the
+  // connection isn't open so the row shows a manual text input instead.
+  async function loadDbs(id: number) {
+    if (id in dbsByConn) return;
+    try {
+      const dbs = await invoke<string[]>("list_databases", { id });
+      const filtered = dbs.filter(
+        (d) =>
+          ![
+            "information_schema",
+            "performance_schema",
+            "mysql",
+            "sys",
+          ].includes(d),
+      );
+      setDbsByConn((m) => ({ ...m, [id]: filtered }));
+    } catch {
+      setDbsByConn((m) => ({ ...m, [id]: null }));
     }
   }
 
@@ -953,6 +999,63 @@ function McpForm({ onClose }: { onClose: () => void }) {
     if (s) setStatus(s);
   }
 
+  async function toggleReadOnly(next: boolean) {
+    const s = await withBusy(() =>
+      invoke<McpStatus>("set_mcp_read_only", { readOnly: next }),
+    );
+    if (s) {
+      setStatus(s);
+      setWrites(s.writeDatabases);
+    }
+  }
+
+  // Persist the given grants (dropping incomplete rows) but keep the full
+  // local list so half-edited rows stay visible while the user fills them in.
+  async function persistWrites(next: McpWriteDbPerm[]) {
+    setWrites(next);
+    const payload = next
+      .filter((w) => w.database.trim() !== "" && w.ops.length > 0)
+      .map((w) => ({
+        connectionId: w.connectionId,
+        database: w.database.trim(),
+        ops: w.ops,
+      }));
+    const s = await withBusy(() =>
+      invoke<McpStatus>("set_mcp_write_databases", { writeDatabases: payload }),
+    );
+    if (s) setStatus(s);
+  }
+
+  function addWriteRow() {
+    const first = connections[0];
+    if (!first?.id) {
+      setError("Add a MySQL connection first.");
+      return;
+    }
+    // Draft row — not persisted until it has both a database and an op.
+    setWrites((w) => [...w, { connectionId: first.id!, database: "", ops: [] }]);
+    void loadDbs(first.id);
+  }
+
+  function toggleWriteOp(i: number, op: string) {
+    const row = writes[i];
+    if (!row) return;
+    const ops = row.ops.includes(op)
+      ? row.ops.filter((o) => o !== op)
+      : [...row.ops, op];
+    void persistWrites(writes.map((w, idx) => (idx === i ? { ...w, ops } : w)));
+  }
+
+  function updateWriteRow(i: number, patch: Partial<McpWriteDbPerm>) {
+    void persistWrites(
+      writes.map((w, idx) => (idx === i ? { ...w, ...patch } : w)),
+    );
+  }
+
+  function removeWriteRow(i: number) {
+    void persistWrites(writes.filter((_, idx) => idx !== i));
+  }
+
   async function copy(text: string, what: string) {
     const ok = await copyText(text);
     if (ok) {
@@ -1015,8 +1118,9 @@ function McpForm({ onClose }: { onClose: () => void }) {
         <code className="font-mono text-[11px] px-1 bg-bg-2 rounded text-ink-2">
           127.0.0.1
         </code>{" "}
-        so Claude Code / Claude Desktop can call them. Read-only — only
-        SELECT / SHOW / DESC / EXPLAIN allowed; results capped at 1000 rows.
+        so Claude Code / Claude Desktop can call them. Reads (SELECT / SHOW /
+        DESC / EXPLAIN, capped at 1000 rows) are always allowed; writes are
+        off by default and must be granted per database below.
       </p>
 
       {/* ── Status row ── */}
@@ -1170,6 +1274,149 @@ function McpForm({ onClose }: { onClose: () => void }) {
             })
           )}
         </div>
+      </div>
+
+      {/* ── Writes (INSERT / UPDATE / DELETE) ── */}
+      <div className="flex flex-col gap-1.5">
+        <div className="flex items-center justify-between">
+          <span className="text-[10px] uppercase tracking-wider font-semibold text-muted">
+            Writes
+          </span>
+          <label className="flex items-center gap-1.5 cursor-pointer">
+            <input
+              type="checkbox"
+              checked={!status.readOnly}
+              disabled={busy}
+              onChange={(e) => void toggleReadOnly(!e.target.checked)}
+              className="w-3.5 h-3.5 accent-acc cursor-pointer"
+            />
+            <span className="text-[11px] text-ink">Allow writes via MCP</span>
+          </label>
+        </div>
+        {status.readOnly ? (
+          <p className="text-[11px] text-muted leading-snug">
+            Read-only mode — MCP cannot modify data. Enable writes to grant
+            INSERT / UPDATE / DELETE on specific databases below.
+          </p>
+        ) : (
+          <>
+            <p className="text-[11px] text-muted leading-snug">
+              For each database, tick the operations MCP may run. A database
+              with no operations ticked stays read-only. Changes take effect
+              immediately.
+            </p>
+            <div className="flex flex-col gap-1">
+              {writes.length === 0 ? (
+                <div className="px-2 py-2 text-[11px] text-muted border border-border rounded">
+                  No write grants yet. Add one below.
+                </div>
+              ) : (
+                writes.map((w, i) => (
+                  <div
+                    key={i}
+                    className="flex items-center gap-2 px-2 py-1.5 border border-border rounded"
+                  >
+                    <select
+                      value={w.connectionId}
+                      disabled={busy}
+                      onChange={(e) => {
+                        const cid = Number(e.target.value);
+                        void loadDbs(cid);
+                        updateWriteRow(i, { connectionId: cid, database: "" });
+                      }}
+                      className="h-7 w-28 shrink-0 rounded border border-border bg-panel-2 px-1 text-[11px] text-ink"
+                    >
+                      {connections.map((c) => (
+                        <option key={c.id} value={c.id!}>
+                          {c.name}
+                        </option>
+                      ))}
+                    </select>
+                    {(() => {
+                      const dbs = dbsByConn[w.connectionId];
+                      if (dbs && dbs.length > 0) {
+                        // Include the current value even if it's a system/hidden
+                        // schema not in the fetched list.
+                        const opts =
+                          w.database && !dbs.includes(w.database)
+                            ? [w.database, ...dbs]
+                            : dbs;
+                        return (
+                          <select
+                            value={w.database}
+                            disabled={busy}
+                            onChange={(e) =>
+                              updateWriteRow(i, { database: e.target.value })
+                            }
+                            className="h-7 flex-1 min-w-0 rounded border border-border bg-panel-2 px-1 text-[11px] font-mono text-ink"
+                          >
+                            <option value="">— pick database —</option>
+                            {opts.map((d) => (
+                              <option key={d} value={d}>
+                                {d}
+                              </option>
+                            ))}
+                          </select>
+                        );
+                      }
+                      return (
+                        <input
+                          type="text"
+                          value={w.database}
+                          placeholder={
+                            dbs === null
+                              ? "database (open connection to list)"
+                              : "database"
+                          }
+                          disabled={busy}
+                          onChange={(e) =>
+                            updateWriteRow(i, { database: e.target.value })
+                          }
+                          className="form-input h-7 text-[11px] flex-1 min-w-0 font-mono"
+                        />
+                      );
+                    })()}
+                    {["insert", "update", "delete"].map((op) => (
+                      <label
+                        key={op}
+                        className="flex items-center gap-1 cursor-pointer shrink-0"
+                        title={op}
+                      >
+                        <input
+                          type="checkbox"
+                          checked={w.ops.includes(op)}
+                          disabled={busy}
+                          onChange={() => toggleWriteOp(i, op)}
+                          className="w-3.5 h-3.5 accent-acc cursor-pointer"
+                        />
+                        <span className="text-[10.5px] uppercase text-ink-2">
+                          {op.slice(0, 3)}
+                        </span>
+                      </label>
+                    ))}
+                    <button
+                      type="button"
+                      onClick={() => removeWriteRow(i)}
+                      disabled={busy}
+                      className="h-7 px-1.5 text-[11px] text-crit hover:bg-bg-2 rounded shrink-0"
+                      title="Remove grant"
+                    >
+                      ✕
+                    </button>
+                  </div>
+                ))
+              )}
+            </div>
+            <button
+              type="button"
+              onClick={addWriteRow}
+              disabled={busy || connections.length === 0}
+              className="self-start h-7 px-2 text-[11px] text-acc bg-panel border border-border rounded hover:bg-bg-2 disabled:opacity-50"
+            >
+              + Add database grant
+            </button>
+          </>
+        )}
       </div>
 
       {/* ── Endpoint + quick setup ── */}

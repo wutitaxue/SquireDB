@@ -3,7 +3,123 @@ import CodeMirror, { type ReactCodeMirrorRef } from "@uiw/react-codemirror";
 import { sql, MySQL } from "@codemirror/lang-sql";
 import { EditorView, keymap } from "@codemirror/view";
 import { HighlightStyle, syntaxHighlighting } from "@codemirror/language";
+import type { CompletionContext, CompletionResult, CompletionSource } from "@codemirror/autocomplete";
 import { tags as t } from "@lezer/highlight";
+import { formatSql } from "../formatSql";
+
+/** Reformat the current selection (if any) or the whole document in place,
+ *  dispatched as a single edit so it's a single undo step. Returns true so it
+ *  can be used directly as a keymap `run` handler. */
+export function runFormat(view: EditorView): boolean {
+  const { from, to } = view.state.selection.main;
+  if (from !== to) {
+    const formatted = formatSql(view.state.sliceDoc(from, to));
+    view.dispatch({
+      changes: { from, to, insert: formatted },
+      selection: { anchor: from, head: from + formatted.length },
+    });
+  } else {
+    const doc = view.state.doc.toString();
+    const formatted = formatSql(doc);
+    if (formatted !== doc) {
+      view.dispatch({ changes: { from: 0, to: doc.length, insert: formatted } });
+    }
+  }
+  return true;
+}
+
+// Keywords that can legally follow a table reference — used to avoid mistaking
+// them for a table alias (e.g. `FROM users WHERE ...` — `WHERE` is not an alias).
+const CLAUSE_KW = new Set([
+  "on", "using", "where", "inner", "left", "right", "full", "cross", "outer",
+  "join", "straight_join", "natural", "group", "order", "having", "limit",
+  "offset", "union", "select", "set", "values", "for", "lock", "window",
+  "into", "as", "and", "or",
+]);
+
+/** Parse the FROM / JOIN table references (with optional aliases) out of a
+ *  single SQL statement. Regex-based and deliberately forgiving: it handles
+ *  comma-joined FROM lists and multiple JOINs, skips subqueries, and ignores
+ *  clause keywords that look like aliases. Good enough to drive completion. */
+function tablesInScope(stmt: string): Array<{ table: string; alias?: string }> {
+  const refs: Array<{ table: string; alias?: string }> = [];
+  const re = /\b(from|join)\b/gi;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(stmt))) {
+    const isFrom = m[1].toLowerCase() === "from";
+    let i = m.index + m[0].length;
+    for (;;) {
+      const tbl = /^\s*([`\w.]+)/.exec(stmt.slice(i));
+      if (!tbl || tbl[1].startsWith("(")) break;
+      i += tbl[0].length;
+      const table = tbl[1].replace(/`/g, "");
+      let alias: string | undefined;
+      const al = /^\s+(?:as\s+)?([`\w]+)/i.exec(stmt.slice(i));
+      if (al) {
+        const cand = al[1].replace(/`/g, "");
+        if (!CLAUSE_KW.has(cand.toLowerCase())) {
+          alias = cand;
+          i += al[0].length;
+        }
+      }
+      if (table && !CLAUSE_KW.has(table.toLowerCase())) refs.push({ table, alias });
+      const comma = /^\s*,/.exec(stmt.slice(i));
+      if (isFrom && comma) {
+        i += comma[0].length;
+        continue;
+      }
+      break;
+    }
+  }
+  return refs;
+}
+
+/** Completion source that offers columns of the tables in the current
+ *  statement's FROM / JOIN when the user types a bare identifier — the piece
+ *  lang-sql doesn't do on its own (it only completes columns after a
+ *  `table.` / `alias.` prefix). Dotted references are left to lang-sql. */
+function columnContextCompletion(schema: Record<string, string[]>): CompletionSource {
+  return (context: CompletionContext): CompletionResult | null => {
+    const word = context.matchBefore(/\w*/);
+    if (!word) return null;
+    // Skip dotted refs (`t.col`) — lang-sql resolves those correctly already.
+    if (word.from > 0 && context.state.sliceDoc(word.from - 1, word.from) === ".") return null;
+    if (word.from === word.to && !context.explicit) return null;
+
+    const full = context.state.doc.toString();
+    const pos = context.pos;
+    const start = full.lastIndexOf(";", pos - 1) + 1;
+    let end = full.indexOf(";", pos);
+    if (end === -1) end = full.length;
+    const refs = tablesInScope(full.slice(start, end));
+    if (refs.length === 0) return null;
+
+    // column name -> the table names / aliases that expose it (shown as detail).
+    const byCol = new Map<string, Set<string>>();
+    for (const ref of refs) {
+      const bare = ref.table.split(".").pop() ?? ref.table;
+      const cols = schema[ref.table] ?? schema[bare] ?? [];
+      const owner = ref.alias ?? bare;
+      for (const c of cols) {
+        let owners = byCol.get(c);
+        if (!owners) {
+          owners = new Set();
+          byCol.set(c, owners);
+        }
+        owners.add(owner);
+      }
+    }
+    if (byCol.size === 0) return null;
+
+    const options = [...byCol.entries()].map(([label, owners]) => ({
+      label,
+      type: "property",
+      detail: [...owners].join(", "),
+      boost: 2,
+    }));
+    return { from: word.from, options, validFor: /^\w*$/ };
+  };
+}
 
 /** Read the currently-selected fragment from a CodeMirror ref. Returns
  *  `undefined` when there's no selection or the editor isn't mounted —
@@ -145,9 +261,17 @@ export function SqlEditor({ value, onChange, onRun, editorRef, readOnly, schema 
   const onRunRef = useRef(onRun);
   onRunRef.current = onRun;
 
-  const extensions = useMemo(
-    () => [
-      sql({ dialect: MySQL, schema, upperCaseKeywords: true }),
+  const extensions = useMemo(() => {
+    const sqlSupport = sql({ dialect: MySQL, schema, upperCaseKeywords: true });
+    return [
+      sqlSupport,
+      // Extra completion source scoped to the SQL language: bare-identifier
+      // column completion from the current statement's FROM / JOIN tables.
+      // Merged with lang-sql's own table/keyword source by the autocomplete
+      // facet, and boosted so columns rank above them.
+      sqlSupport.language.data.of({
+        autocomplete: columnContextCompletion(schema ?? {}),
+      }),
       syntaxHighlighting(highlight),
       editorTheme,
       keymap.of([
@@ -160,11 +284,15 @@ export function SqlEditor({ value, onChange, onRun, editorRef, readOnly, schema 
             return true;
           },
         },
+        {
+          key: "Mod-Shift-f",
+          preventDefault: true,
+          run: runFormat,
+        },
       ]),
       EditorView.lineWrapping,
-    ],
-    [schema],
-  );
+    ];
+  }, [schema]);
 
   return (
     <CodeMirror

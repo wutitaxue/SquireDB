@@ -14,6 +14,7 @@ import type {
   QueryResult,
 } from "../types";
 import { copyText, isImeComposing, parseLookupValue, renderCell } from "../utils";
+import type { ColumnFilter, FilterOp } from "../sqlWhere";
 import {
   EXPORT_FORMAT_META,
   backtick,
@@ -28,6 +29,36 @@ import { CellViewer, isViewerWorthy } from "./CellViewer";
 const EXPORT_FORMATS: ExportFormat[] = ["csv", "json", "markdown", "sql"];
 
 type ViewKind = "table" | "chart" | "json" | "plan";
+
+// --- Header chrome measurement ----------------------------------------------
+// Measure header text with a cached canvas so column-width math is exact rather
+// than guessed from character counts.
+let _hdrCtx: CanvasRenderingContext2D | null = null;
+function measureHdrText(text: string, font: string): number {
+  if (typeof document === "undefined") return text.length * 7;
+  if (!_hdrCtx) _hdrCtx = document.createElement("canvas").getContext("2d");
+  if (!_hdrCtx) return text.length * 7;
+  _hdrCtx.font = font;
+  return _hdrCtx.measureText(text).width;
+}
+
+const HDR_NAME_FONT = "600 11px system-ui, -apple-system, sans-serif";
+const HDR_TYPE_FONT = "400 10px ui-monospace, SFMono-Regular, monospace";
+const DATA_FONT = "12px ui-monospace, SFMono-Regular, monospace";
+
+// Width budget for a header cell. `min` fits the name (+ PK icon) and BOTH the
+// sort/filter buttons — the resize floor, so they can never be clipped. `full`
+// additionally fits the type label; below `full` the type label is dropped.
+function colChrome(name: string, typeName: string, isPk: boolean): { min: number; full: number } {
+  const PAD = 16; // px-2 on both sides
+  const PK = isPk ? 22 : 0; // 🔑 + mr-1
+  const BUTTONS = 46; // sort (w-5) + filter (w-5) + gaps
+  const SLACK = 8;
+  const nameW = measureHdrText(name, HDR_NAME_FONT);
+  const typeW = measureHdrText(typeName, HDR_TYPE_FONT) + 6; // + ml-1.5
+  const min = Math.ceil(PAD + PK + nameW + BUTTONS + SLACK);
+  return { min, full: Math.ceil(min + typeW) };
+}
 
 type Props = {
   connectionId: number | null;
@@ -61,6 +92,25 @@ type Props = {
   onClearSort?: () => void;
   /** Currently-injected sort, used to render the ▲/▼ indicator. */
   sort?: { column: string; dir: "asc" | "desc" } | null;
+
+  /** Server-side column filters keyed by column name (WHERE pushdown). When
+   *  provided the filter popover shows a "Filter in database" builder that
+   *  rewrites the SQL and reruns. Undefined disables it (e.g. GROUP BY / UNION
+   *  queries whose WHERE we can't safely rewrite, or non-SQL results). The
+   *  local value-picker below it is always available. */
+  dbFilters?: Record<string, ColumnFilter>;
+  onDbFilterChange?: (column: string, filter: ColumnFilter | null) => void;
+  onClearDbFilters?: () => void;
+
+  /** Hidden column names (keyed by name, not index, so the set survives
+   *  Run wiping the batch). Owned by QueryWorkspace per-tab. */
+  hiddenCols?: Set<string>;
+  onHiddenColsChange?: (next: Set<string>) => void;
+
+  /** User-dragged column widths, keyed by column name → px. Same lifetime
+   *  reasoning as hiddenCols. */
+  columnWidths?: Record<string, number>;
+  onColumnWidthsChange?: (next: Record<string, number>) => void;
 };
 
 const DEFAULT_VIEWS: ViewKind[] = ["table", "chart", "json", "plan"];
@@ -134,6 +184,9 @@ function ResultsPaneImpl(props: Props) {
     onSort,
     onClearSort,
     sort,
+    dbFilters,
+    onDbFilterChange,
+    onClearDbFilters,
   } = props;
 
   const [view, setView] = useState<ViewKind>("table");
@@ -166,6 +219,26 @@ function ResultsPaneImpl(props: Props) {
   const [copyOpen, setCopyOpen] = useState(false);
   const exportMenuRef = useRef<HTMLDivElement>(null);
   const copyMenuRef = useRef<HTMLDivElement>(null);
+  // Column visibility is owned by the parent (QueryWorkspace) per-tab so it
+  // survives a Run wiping the previous batch (which momentarily unmounts this
+  // component). Fall back to an empty uncontrolled state if the caller doesn't
+  // pass it — e.g. drill / agent panes that don't need persistence.
+  const [uncontrolledHiddenCols, setUncontrolledHiddenCols] = useState<Set<string>>(new Set());
+  const hiddenCols = props.hiddenCols ?? uncontrolledHiddenCols;
+  const setHiddenCols = (next: Set<string>) => {
+    if (props.onHiddenColsChange) props.onHiddenColsChange(next);
+    else setUncontrolledHiddenCols(next);
+  };
+  // Column widths — same uncontrolled-fallback pattern as hiddenCols.
+  const [uncontrolledColumnWidths, setUncontrolledColumnWidths] = useState<Record<string, number>>({});
+  const columnWidths = props.columnWidths ?? uncontrolledColumnWidths;
+  const setColumnWidths = (next: Record<string, number>) => {
+    if (props.onColumnWidthsChange) props.onColumnWidthsChange(next);
+    else setUncontrolledColumnWidths(next);
+  };
+  const [colsOpen, setColsOpen] = useState(false);
+  const [colsQuery, setColsQuery] = useState("");
+  const colsMenuRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
     if (!copyFlash) return;
@@ -208,6 +281,23 @@ function ResultsPaneImpl(props: Props) {
     };
   }, [copyOpen]);
 
+  useEffect(() => {
+    if (!colsOpen) return;
+    function onDocPointer(e: PointerEvent) {
+      if (!colsMenuRef.current) return;
+      if (!colsMenuRef.current.contains(e.target as Node)) setColsOpen(false);
+    }
+    function onKey(e: KeyboardEvent) {
+      if (e.key === "Escape") setColsOpen(false);
+    }
+    document.addEventListener("pointerdown", onDocPointer);
+    document.addEventListener("keydown", onKey);
+    return () => {
+      document.removeEventListener("pointerdown", onDocPointer);
+      document.removeEventListener("keydown", onKey);
+    };
+  }, [colsOpen]);
+
   async function runExport(fmt: ExportFormat) {
     setExportOpen(false);
     setExportError("");
@@ -238,6 +328,9 @@ function ResultsPaneImpl(props: Props) {
     setMutationError("");
     setMutationStatus("");
     setPendingEdits(new Map());
+    // Note: hiddenCols intentionally NOT reset here — column visibility is a
+    // user preference that persists across re-runs within the same tab. Stale
+    // names from old result schemas are harmless (they just don't match).
   }, [result]);
 
   function selectView(v: ViewKind) {
@@ -529,6 +622,19 @@ function ResultsPaneImpl(props: Props) {
               <span className="text-warn">{rowLimitNotice}</span>
             </>
           )}
+          {dbFilters && Object.keys(dbFilters).length > 0 && onClearDbFilters && (
+            <>
+              <span className="text-border-2">·</span>
+              <button
+                onClick={onClearDbFilters}
+                title="Remove all database column filters and rerun"
+                className="text-acc hover:text-acc-2 font-medium"
+              >
+                {Object.keys(dbFilters).length} filter
+                {Object.keys(dbFilters).length > 1 ? "s" : ""} ✕
+              </button>
+            </>
+          )}
           {editable && (
             <>
               <span className="text-border-2">·</span>
@@ -540,6 +646,28 @@ function ResultsPaneImpl(props: Props) {
               </span>
             </>
           )}
+          {(() => {
+            // Count only names that exist in current result.columns; stale
+            // names from a prior result schema shouldn't inflate the badge.
+            const effectiveHidden = result.columns.reduce(
+              (n, c) => (hiddenCols.has(c.name) ? n + 1 : n),
+              0,
+            );
+            return (
+              effectiveHidden > 0 && (
+                <>
+                  <span className="text-border-2">·</span>
+                  <button
+                    onClick={() => setHiddenCols(new Set())}
+                    className="text-warn hover:underline"
+                    title="Click to show all columns"
+                  >
+                    {effectiveHidden} column{effectiveHidden > 1 ? "s" : ""} hidden
+                  </button>
+                </>
+              )
+            );
+          })()}
         </span>
 
         <div className="flex-1" />
@@ -624,6 +752,108 @@ function ResultsPaneImpl(props: Props) {
           </>
         )}
 
+        {view === "table" && result.columns.length > 0 && (() => {
+          const visibleCount = result.columns.reduce(
+            (n, c) => (hiddenCols.has(c.name) ? n : n + 1),
+            0,
+          );
+          const someHidden = visibleCount < result.columns.length;
+          return (
+            <div className="relative" ref={colsMenuRef}>
+              <button
+                onClick={() => {
+                  setColsOpen((v) => !v);
+                  setColsQuery("");
+                }}
+                title="Show / hide columns"
+                className={`h-6 px-2 text-[11px] font-medium rounded-md border inline-flex items-center gap-1 whitespace-nowrap shrink-0 ${
+                  someHidden
+                    ? "text-acc bg-acc-soft/40 border-acc/40"
+                    : "text-ink-2 bg-bg border-border hover:bg-bg-2"
+                }`}
+              >
+                Columns
+                {someHidden && (
+                  <span className="tabular-nums">
+                    ({visibleCount}/{result.columns.length})
+                  </span>
+                )}
+                <span className="text-muted text-[9px]">▾</span>
+              </button>
+              {colsOpen && (
+                <div className="absolute right-0 top-7 z-30 w-[280px] max-h-[420px] bg-panel border border-border rounded-md shadow-lg flex flex-col">
+                  <div className="p-2 border-b border-border shrink-0">
+                    <input
+                      autoFocus
+                      type="text"
+                      value={colsQuery}
+                      onChange={(e) => setColsQuery(e.target.value)}
+                      placeholder="Filter columns…"
+                      className="w-full px-2 h-7 text-[11px] bg-bg border border-border rounded outline-none focus:border-acc"
+                    />
+                    <div className="flex items-center gap-1 mt-1.5">
+                      <button
+                        onClick={() => setHiddenCols(new Set())}
+                        className="flex-1 h-6 px-2 text-[10px] text-ink-2 bg-bg border border-border rounded hover:bg-bg-2"
+                      >
+                        Show all
+                      </button>
+                      <button
+                        onClick={() => {
+                          // Leave the first column visible to avoid an empty grid.
+                          const all = new Set<string>();
+                          for (let j = 1; j < result.columns.length; j++) {
+                            all.add(result.columns[j].name);
+                          }
+                          setHiddenCols(all);
+                        }}
+                        className="flex-1 h-6 px-2 text-[10px] text-ink-2 bg-bg border border-border rounded hover:bg-bg-2"
+                        title="Hides all except the first column"
+                      >
+                        Hide all
+                      </button>
+                    </div>
+                  </div>
+                  <div className="flex-1 min-h-0 overflow-y-auto py-1">
+                    {result.columns.map((c, j) => {
+                      const q = colsQuery.trim().toLowerCase();
+                      if (q && !c.name.toLowerCase().includes(q)) return null;
+                      const visible = !hiddenCols.has(c.name);
+                      const isLastVisible = visible && visibleCount === 1;
+                      return (
+                        <label
+                          key={j}
+                          className={`flex items-center gap-2 px-2.5 py-1 text-[11px] hover:bg-bg-2 ${
+                            isLastVisible ? "opacity-60 cursor-not-allowed" : "cursor-pointer"
+                          }`}
+                          title={isLastVisible ? "At least one column must stay visible" : undefined}
+                        >
+                          <input
+                            type="checkbox"
+                            checked={visible}
+                            disabled={isLastVisible}
+                            onChange={(e) => {
+                              const next = new Set(hiddenCols);
+                              if (e.target.checked) next.delete(c.name);
+                              else next.add(c.name);
+                              setHiddenCols(next);
+                            }}
+                            className="cursor-pointer"
+                          />
+                          <span className="text-ink-2 truncate flex-1">{c.name}</span>
+                          <span className="text-subtle font-mono text-[10px] shrink-0">
+                            {c.type_name}
+                          </span>
+                        </label>
+                      );
+                    })}
+                  </div>
+                </div>
+              )}
+            </div>
+          );
+        })()}
+
         <div className="relative" ref={exportMenuRef}>
           <button
             onClick={() => setExportOpen((v) => !v)}
@@ -685,6 +915,11 @@ function ResultsPaneImpl(props: Props) {
           onSort={onSort}
           onClearSort={onClearSort}
           sort={sort ?? null}
+          dbFilters={dbFilters}
+          onDbFilterChange={onDbFilterChange}
+          hiddenCols={hiddenCols}
+          columnWidths={columnWidths}
+          onColumnWidthsChange={setColumnWidths}
         />
       ) : (
         <div className="flex-1 min-h-0 overflow-auto">
@@ -792,6 +1027,11 @@ function TableView({
   onSort,
   onClearSort,
   sort,
+  dbFilters,
+  onDbFilterChange,
+  hiddenCols,
+  columnWidths,
+  onColumnWidthsChange,
 }: {
   result: QueryResult;
   numericMask: boolean[];
@@ -807,6 +1047,11 @@ function TableView({
   onSort?: (columnName: string, dir: "asc" | "desc") => void;
   onClearSort?: () => void;
   sort: { column: string; dir: "asc" | "desc" } | null;
+  dbFilters?: Record<string, ColumnFilter>;
+  onDbFilterChange?: (column: string, filter: ColumnFilter | null) => void;
+  hiddenCols: Set<string>;
+  columnWidths: Record<string, number>;
+  onColumnWidthsChange: (next: Record<string, number>) => void;
 }) {
   const [editing, setEditing] = useState<{ row: number; col: number } | null>(null);
   const [draft, setDraft] = useState("");
@@ -887,7 +1132,29 @@ function TableView({
   function commitEdit() {
     if (!editing) return;
     const { row, col } = editing;
-    const next = parseLookupValue(draft);
+    const original = result.rows[row][col];
+    // If the draft text is identical to how the original value renders in the
+    // editor, treat this as a no-op — entering and leaving a cell without
+    // typing must never mark it dirty. Without this guard, parseLookupValue can
+    // change the value's *type* (e.g. a VARCHAR holding "702112607133007"
+    // becomes the number 702112607133007), which then reads as an edit.
+    const originalText =
+      original === null
+        ? "null"
+        : typeof original === "string"
+          ? original
+          : typeof original === "object"
+            ? JSON.stringify(original)
+            : String(original);
+    if (draft === originalText) {
+      setEditing(null);
+      return;
+    }
+    // String-typed columns keep the raw text — don't coerce "123" to a number
+    // for a VARCHAR/CHAR/TEXT/ENUM column, only for genuinely numeric columns.
+    const typeName = (result.columns[col]?.type_name ?? "").toUpperCase();
+    const isStringCol = /CHAR|TEXT|ENUM|SET|BLOB|BINARY|JSON/.test(typeName);
+    const next = isStringCol && draft !== "null" ? draft : parseLookupValue(draft);
     setEditing(null);
     onRecordEdit(row, col, next);
   }
@@ -952,15 +1219,102 @@ function TableView({
   // each, so a header cell wider than its row data would produce different
   // column widths and visibly misalign the header from the body. Use pure
   // <length> minmax bounds so identical templates render identical tracks.
+  const visibleColIndices = useMemo(() => {
+    const out: number[] = [];
+    for (let j = 0; j < result.columns.length; j++) {
+      if (!hiddenCols.has(result.columns[j].name)) out.push(j);
+    }
+    // Defensive: if a stale `hiddenCols` (e.g. from a previous result schema)
+    // would hide every column in the current result, fall back to showing all
+    // so the grid isn't empty. The UI checkbox disable already prevents this
+    // for in-session toggling, but a result schema change could still trip it.
+    if (out.length === 0 && result.columns.length > 0) {
+      for (let j = 0; j < result.columns.length; j++) out.push(j);
+    }
+    return out;
+  }, [result.columns, hiddenCols]);
+
+  // Widest rendered data value per column (px), sampled over the first rows.
+  // Drives content-aware default widths so short-content columns (numbers,
+  // booleans, short enums) hug their content instead of ballooning, while long
+  // text columns grow up to the cap.
+  const colDataWidths = useMemo(() => {
+    const widths = new Array<number>(result.columns.length).fill(0);
+    const sample = result.rows.slice(0, 80);
+    for (let i = 0; i < result.columns.length; i++) {
+      let max = 0;
+      for (const row of sample) {
+        const v = row[i];
+        if (v === null || v === undefined) continue;
+        const s = typeof v === "object" ? JSON.stringify(v) : String(v);
+        const w = measureHdrText(s.length > 64 ? s.slice(0, 64) : s, DATA_FONT);
+        if (w > max) max = w;
+      }
+      widths[i] = max;
+    }
+    return widths;
+  }, [result]);
+
   const gridTemplate = useMemo(() => {
+    const DATA_CAP = 320; // upper bound for long-text columns
+    const DATA_PAD = 24; // px-2 cell padding + slack
     const cols: string[] = [];
     if (editable) cols.push("36px");
     cols.push("48px"); // row number
-    for (let j = 0; j < result.columns.length; j++) {
-      cols.push(numericMask[j] ? "minmax(100px, 180px)" : "minmax(140px, 320px)");
+    for (const j of visibleColIndices) {
+      const col = result.columns[j];
+      const { min, full } = colChrome(col.name, col.type_name, pkSet.has(j));
+      const custom = columnWidths[col.name];
+      if (custom != null) {
+        // Never render narrower than the floor that fits name + buttons, so a
+        // stale/over-dragged width can't clip the action buttons.
+        cols.push(`${Math.max(min, custom)}px`);
+      } else {
+        // Content-aware default: at least wide enough for the header (name +
+        // type + buttons), growing to fit the data up to the cap. Type matters
+        // only as a floor — short data never balloons, long data is bounded.
+        const dataW = Math.ceil(colDataWidths[j] + DATA_PAD);
+        cols.push(`${Math.max(full, Math.min(DATA_CAP, dataW))}px`);
+      }
     }
     return cols.join(" ");
-  }, [editable, numericMask, result.columns.length]);
+  }, [editable, visibleColIndices, result.columns, columnWidths, pkSet, colDataWidths]);
+
+  // Resize handle drag — captures the header cell's current width at
+  // pointerdown so subsequent moves are relative to that, then updates the
+  // controlled width map on each move. We bind to window so the drag continues
+  // even if the pointer leaves the handle / cell.
+  function startResize(e: React.PointerEvent<HTMLDivElement>, colName: string, minW: number) {
+    e.preventDefault();
+    e.stopPropagation();
+    const headerCell = (e.currentTarget as HTMLElement).parentElement;
+    if (!headerCell) return;
+    const startX = e.clientX;
+    const startWidth = headerCell.getBoundingClientRect().width;
+    const baseWidths = columnWidths;
+    function onMove(ev: PointerEvent) {
+      const next = Math.max(minW, Math.min(1200, startWidth + (ev.clientX - startX)));
+      onColumnWidthsChange({ ...baseWidths, [colName]: next });
+    }
+    function onEnd() {
+      window.removeEventListener("pointermove", onMove);
+      window.removeEventListener("pointerup", onEnd);
+      document.body.style.cursor = "";
+      document.body.style.userSelect = "";
+    }
+    window.addEventListener("pointermove", onMove);
+    window.addEventListener("pointerup", onEnd);
+    // Lock cursor + suppress text selection during the drag so it feels native.
+    document.body.style.cursor = "col-resize";
+    document.body.style.userSelect = "none";
+  }
+
+  function resetColumnWidth(colName: string) {
+    if (columnWidths[colName] == null) return;
+    const next = { ...columnWidths };
+    delete next[colName];
+    onColumnWidthsChange(next);
+  }
 
   const scrollRef = useRef<HTMLDivElement | null>(null);
   const rowVirtualizer = useVirtualizer({
@@ -1014,27 +1368,42 @@ function TableView({
           <div className="flex items-center justify-end px-2 text-[11px] font-semibold text-muted border-r border-border/40 select-none">
             #
           </div>
-          {result.columns.map((c, j) => {
+          {visibleColIndices.map((j) => {
+            const c = result.columns[j];
             const sorted = sort?.column === c.name ? sort.dir : null;
             const sortable = !!onSort;
             const filterSet = filters[j];
-            const hasFilter = !!filterSet && filterSet.size > 0;
+            const hasDbFilter = !!dbFilters && !!dbFilters[c.name];
+            const hasFilter = (!!filterSet && filterSet.size > 0) || hasDbFilter;
             const isActive = activeCol === j;
+            // The name (+ PK icon) and both action buttons always stay visible
+            // (the resize floor guarantees room for them). Only the type label
+            // yields: drop it once a dragged column is narrower than the width
+            // that fits name + type + buttons.
+            const draggedW = columnWidths[c.name];
+            const { min: minColW, full: fullColW } = colChrome(
+              c.name,
+              c.type_name,
+              pkSet.has(j),
+            );
+            const hideType = draggedW != null && draggedW < fullColW;
             return (
               <div
                 key={c.name}
                 onClick={() => setActiveCol(j)}
-                className={`flex items-center px-2 text-[11px] font-semibold text-ink-2 whitespace-nowrap overflow-hidden border-r border-border/40 select-none cursor-pointer ${
+                className={`relative flex items-center px-2 text-[11px] font-semibold text-ink-2 whitespace-nowrap overflow-hidden border-r border-border/40 select-none cursor-pointer ${
                   numericMask[j] ? "justify-end" : "justify-start"
                 } ${isActive ? "bg-acc-soft/60" : sorted ? "bg-acc-soft/40" : ""}`}
               >
-                <span className="truncate">
-                  {pkSet.has(j) && <span className="text-acc mr-1" title="Primary key">🔑</span>}
+                <span className="shrink-0 whitespace-nowrap flex items-center">
+                  {pkSet.has(j) && <span className="text-acc mr-1 shrink-0" title="Primary key">🔑</span>}
                   {c.name}
                 </span>
-                <span className="text-subtle font-mono font-normal ml-1.5 text-[10px] shrink-0">
-                  {c.type_name}
-                </span>
+                {!hideType && (
+                  <span className="text-subtle font-mono font-normal ml-1.5 text-[10px] shrink-0 whitespace-nowrap">
+                    {c.type_name}
+                  </span>
+                )}
                 <span className="flex-1" />
                 {sortable && (
                   <button
@@ -1089,7 +1458,13 @@ function TableView({
                       });
                     }
                   }}
-                  title={hasFilter ? `Filter: ${filterSet!.size} value(s) selected` : "Filter this column"}
+                  title={
+                    hasDbFilter
+                      ? `DB filter: ${dbFilters![c.name].op} ${dbFilters![c.name].value}`.trim()
+                      : filterSet && filterSet.size > 0
+                        ? `Local filter: ${filterSet.size} value(s) selected`
+                        : "Filter this column"
+                  }
                   className={`w-5 h-5 flex items-center justify-center rounded hover:bg-bg shrink-0 ${
                     hasFilter ? "text-acc" : "text-subtle hover:text-ink-2"
                   }`}
@@ -1106,6 +1481,17 @@ function TableView({
                     <path d="M1 1.5 H9 L6 5.2 V8.5 L4 9.2 V5.2 Z" />
                   </svg>
                 </button>
+                <div
+                  onPointerDown={(e) => startResize(e, c.name, minColW)}
+                  onDoubleClick={(e) => {
+                    e.stopPropagation();
+                    resetColumnWidth(c.name);
+                  }}
+                  title="Drag to resize · double-click to reset"
+                  className="group absolute top-0 right-0 h-full w-1.5 cursor-col-resize z-10"
+                >
+                  <div className="absolute right-0 top-1 bottom-1 w-px bg-transparent group-hover:bg-acc transition-colors" />
+                </div>
               </div>
             );
           })}
@@ -1156,7 +1542,8 @@ function TableView({
               <div className="flex items-center justify-end px-2 text-[11px] text-subtle font-mono tabular-nums select-none border-r border-border/30">
                 {visIdx + 1}
               </div>
-              {row.map((cell, j) => {
+              {visibleColIndices.map((j) => {
+                const cell = row[j];
                 const pending = pendingEdits.get(`${originalIdx}-${j}`);
                 const displayCell = pending ? pending.value : cell;
                 const rendered = renderCell(displayCell);
@@ -1286,6 +1673,14 @@ function TableView({
             rows={result.rows}
             colIdx={openFilter.col}
             selected={filters[openFilter.col] ?? null}
+            dbFilter={
+              dbFilters ? dbFilters[result.columns[openFilter.col].name] ?? null : undefined
+            }
+            onDbFilterChange={
+              dbFilters && onDbFilterChange
+                ? (f) => onDbFilterChange(result.columns[openFilter.col].name, f)
+                : undefined
+            }
             onChange={(next) =>
               setFilters((prev) => {
                 const copy = { ...prev };
@@ -1318,14 +1713,63 @@ type FilterPopoverProps = {
   onClose: () => void;
   anchorRight: number;
   anchorBottom: number;
+  /** Current server-side WHERE filter for this column (undefined = DB filter
+   *  not available for this query; null = available but unset). */
+  dbFilter?: ColumnFilter | null;
+  onDbFilterChange?: (filter: ColumnFilter | null) => void;
 };
+
+const FILTER_OPS: FilterOp[] = [
+  "=",
+  "!=",
+  ">",
+  ">=",
+  "<",
+  "<=",
+  "LIKE",
+  "NOT LIKE",
+  "IN",
+  "IS NULL",
+  "IS NOT NULL",
+];
+
+/** Ops that don't take a value input. */
+const NULLARY_OPS = new Set<FilterOp>(["IS NULL", "IS NOT NULL"]);
 
 const FilterPopover = forwardRef<HTMLDivElement, FilterPopoverProps>(
   function FilterPopover(
-    { columnName, rows, colIdx, selected, onChange, onClose, anchorRight, anchorBottom },
+    {
+      columnName,
+      rows,
+      colIdx,
+      selected,
+      onChange,
+      onClose,
+      anchorRight,
+      anchorBottom,
+      dbFilter,
+      onDbFilterChange,
+    },
     ref,
   ) {
     const [search, setSearch] = useState("");
+    // Draft state for the DB WHERE builder. Seeded from the active dbFilter so
+    // reopening the popover shows the current condition.
+    const [op, setOp] = useState<FilterOp>(dbFilter?.op ?? "=");
+    const [filterValue, setFilterValue] = useState(dbFilter?.value ?? "");
+    const dbAvailable = dbFilter !== undefined && !!onDbFilterChange;
+
+    function applyDb() {
+      if (!onDbFilterChange) return;
+      onDbFilterChange({ op, value: NULLARY_OPS.has(op) ? "" : filterValue });
+      onClose();
+    }
+    function clearDb() {
+      if (!onDbFilterChange) return;
+      setOp("=");
+      setFilterValue("");
+      onDbFilterChange(null);
+    }
 
     // Per-column distinct values + frequencies. Capped at FILTER_DISTINCT_CAP;
     // beyond that the popover degrades to a notice (filtering still works on
@@ -1391,7 +1835,7 @@ const FilterPopover = forwardRef<HTMLDivElement, FilterPopoverProps>(
     }
 
     const W = 280;
-    const H = 360;
+    const H = dbAvailable ? 460 : 360;
     const PAD = 8;
     const vw = typeof window !== "undefined" ? window.innerWidth : 1280;
     const vh = typeof window !== "undefined" ? window.innerHeight : 800;
@@ -1404,6 +1848,58 @@ const FilterPopover = forwardRef<HTMLDivElement, FilterPopoverProps>(
         className="fixed z-50 bg-panel border border-border rounded-md shadow-3 overflow-hidden flex flex-col"
         style={{ left, top, width: W, maxHeight: H }}
       >
+        {dbAvailable && (
+          <div className="px-3 py-2 border-b border-border shrink-0 bg-panel-2">
+            <div className="text-[10px] uppercase tracking-wider font-bold text-muted mb-1.5">
+              Filter in database
+            </div>
+            <div className="flex items-center gap-1.5">
+              <select
+                value={op}
+                onChange={(e) => setOp(e.target.value as FilterOp)}
+                className="h-7 px-1 text-[11px] bg-panel border border-border rounded text-ink outline-none focus:border-acc shrink-0"
+              >
+                {FILTER_OPS.map((o) => (
+                  <option key={o} value={o}>
+                    {o}
+                  </option>
+                ))}
+              </select>
+              {!NULLARY_OPS.has(op) && (
+                <input
+                  type="text"
+                  value={filterValue}
+                  onChange={(e) => setFilterValue(e.target.value)}
+                  onKeyDown={(e) => {
+                    if (e.key === "Enter") {
+                      e.preventDefault();
+                      applyDb();
+                    }
+                  }}
+                  placeholder={op === "IN" ? "a, b, c" : "value"}
+                  className="flex-1 min-w-0 h-7 px-2 text-[12px] bg-panel border border-border rounded outline-none focus:border-acc"
+                />
+              )}
+            </div>
+            <div className="flex items-center gap-1.5 mt-1.5">
+              <button
+                onClick={applyDb}
+                className="h-6 px-2.5 text-[11px] font-semibold text-white bg-acc rounded hover:bg-acc-2"
+              >
+                Apply (rerun)
+              </button>
+              {dbFilter && (
+                <button
+                  onClick={clearDb}
+                  className="h-6 px-2.5 text-[11px] text-ink-2 bg-panel border border-border rounded hover:bg-bg"
+                >
+                  Clear
+                </button>
+              )}
+              <span className="ml-auto text-[10px] text-subtle">rewrites WHERE</span>
+            </div>
+          </div>
+        )}
         <div className="px-3 py-2 border-b border-border text-[11px] text-ink-2 shrink-0">
           Local Filter For{" "}
           <span className="font-mono text-acc-ink">'{columnName}'</span>
@@ -1415,7 +1911,7 @@ const FilterPopover = forwardRef<HTMLDivElement, FilterPopoverProps>(
               🔍
             </span>
             <input
-              autoFocus
+              autoFocus={!dbAvailable}
               type="text"
               value={search}
               onChange={(e) => setSearch(e.target.value)}

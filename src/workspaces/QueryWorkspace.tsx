@@ -8,12 +8,18 @@ import type {
   QueryResult,
   SqlFixSuggestion,
 } from "../types";
-import { SqlEditor, getSelection } from "../panels/SqlEditor";
+import { SqlEditor, getSelection, runFormat } from "../panels/SqlEditor";
 import type { ReactCodeMirrorRef } from "@uiw/react-codemirror";
 import { AiStrip } from "../panels/AiStrip";
 import { ResultsPane } from "../panels/ResultsPane";
 import { useStableCallback } from "../hooks/useStableCallback";
 import { applyOrderBy, clearOrderBy } from "../sqlSort";
+import {
+  applyWhereFilters,
+  buildCondition,
+  whereIsSupported,
+  type ColumnFilter,
+} from "../sqlWhere";
 import { splitSqlStatements } from "../splitSql";
 
 /**
@@ -40,6 +46,8 @@ type Props = {
    *  connection's default. */
   database: string | undefined;
   onChangeDatabase: (next: string | undefined) => void;
+  /** Table → column-name map for schema-aware editor completion. */
+  schema?: Record<string, string[]>;
 };
 
 function QueryWorkspaceImpl({
@@ -51,6 +59,7 @@ function QueryWorkspaceImpl({
   databases,
   database,
   onChangeDatabase,
+  schema,
 }: Props) {
   const [sql, setSql] = useState(injection.sql);
   const [batch, setBatch] = useState<BatchEntry[]>([]);
@@ -84,9 +93,36 @@ function QueryWorkspaceImpl({
   // is only a UI hint and is cleared whenever the user edits the SQL manually.
   const [sortHint, setSortHint] = useState<{ column: string; dir: "asc" | "desc" } | null>(null);
 
+  // Server-side column filters (WHERE pushdown), keyed by column name. Distinct
+  // from ResultsPane's local value-picker filter (which only narrows loaded
+  // rows) — these rewrite the SQL and rerun, so they can surface rows outside
+  // the current page. Cleared on manual SQL edits (the WHERE may have changed).
+  const [dbFilters, setDbFilters] = useState<Record<string, ColumnFilter>>({});
+
+  // Result-pane column visibility lives at the tab level (not inside
+  // ResultsPane) so the preference survives Run wiping the previous batch —
+  // every Run does `setBatch([])` which momentarily unmounts ResultsPane.
+  // Keyed by column name; stale names from old result schemas are harmless.
+  const [hiddenCols, setHiddenCols] = useState<Set<string>>(new Set());
+
+  // Same story for user-dragged column widths. Keyed by column name → px.
+  // Stale entries for columns that no longer exist are harmless.
+  const [columnWidths, setColumnWidths] = useState<Record<string, number>>({});
+
   const [cancelling, setCancelling] = useState(false);
   const runningTokenRef = useRef<string | null>(null);
   const cancellingRef = useRef(false);
+
+  // Manual transaction state. `txnId` is a stable per-workspace-instance id
+  // used as the backend key that binds the transaction to one physical
+  // connection. `inTxn` mirrors whether BEGIN has run and not yet been
+  // committed/rolled back. Manual transactions are MySQL-only.
+  const txnIdRef = useRef<string>(
+    `txn-${conn.id ?? "x"}-${Math.random().toString(36).slice(2, 10)}`,
+  );
+  const [inTxn, setInTxn] = useState(false);
+  const [txnBusy, setTxnBusy] = useState(false);
+  const supportsTxn = conn.kind === "mysql";
 
   async function run(sqlOverride?: string) {
     if (!conn.id || running) return;
@@ -122,6 +158,7 @@ function QueryWorkspaceImpl({
             sql: stmt.sql,
             queryToken,
             database: database ?? null,
+            txnId: inTxn ? txnIdRef.current : null,
           });
           collected.push({ kind: "ok", sql: stmt.sql, result: r });
         } catch (e) {
@@ -159,6 +196,32 @@ function QueryWorkspaceImpl({
       await invoke("cancel_query", { queryToken: token });
     } catch {
       // ignore — KILL might race with completion
+    }
+  }
+
+  async function beginTxn() {
+    if (!conn.id || inTxn || txnBusy) return;
+    setTxnBusy(true);
+    try {
+      await invoke("begin_transaction", { id: conn.id, txnId: txnIdRef.current });
+      setInTxn(true);
+    } catch (e) {
+      setFixError(String(e));
+    } finally {
+      setTxnBusy(false);
+    }
+  }
+
+  async function finishTxn(commit: boolean) {
+    if (!inTxn || txnBusy) return;
+    setTxnBusy(true);
+    try {
+      await invoke("finish_transaction", { txnId: txnIdRef.current, commit });
+      setInTxn(false);
+    } catch (e) {
+      setFixError(String(e));
+    } finally {
+      setTxnBusy(false);
     }
   }
 
@@ -295,11 +358,33 @@ function QueryWorkspaceImpl({
     setSortHint(null);
     void run(next);
   });
+  // Rebuild the managed WHERE block from a filter map and rerun. Shared by
+  // set / clear so both go through one rewrite path.
+  const applyDbFilters = (next: Record<string, ColumnFilter>) => {
+    setDbFilters(next);
+    const conditions = Object.entries(next)
+      .map(([col, f]) => buildCondition(col, f))
+      .filter((c): c is string => c !== null);
+    const rewritten = applyWhereFilters(sqlRef.current, conditions);
+    setSql(rewritten);
+    void run(rewritten);
+  };
+  const stableSetDbFilter = useStableCallback((column: string, f: ColumnFilter | null) => {
+    const next = { ...dbFilters };
+    if (f === null) delete next[column];
+    else next[column] = f;
+    applyDbFilters(next);
+  });
+  const stableClearDbFilters = useStableCallback(() => {
+    if (Object.keys(dbFilters).length === 0) return;
+    applyDbFilters({});
+  });
   // Manual edits to the SQL invalidate the sort indicator — the column may
   // have been renamed, dropped, or the ORDER BY clause rewritten by hand.
   const stableSetSql = useStableCallback((next: string) => {
     setSql(next);
     setSortHint(null);
+    setDbFilters({});
   });
 
   useEffect(() => {
@@ -309,6 +394,21 @@ function QueryWorkspaceImpl({
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [injection.nonce]);
+
+  // Roll back a still-open transaction if this workspace unmounts (tab closed /
+  // connection switched). The backend rolls back and releases the held
+  // connection; without this it would stay checked out of the pool. Uses a ref
+  // so the cleanup runs once on unmount, not on every inTxn toggle.
+  const inTxnRef = useRef(inTxn);
+  inTxnRef.current = inTxn;
+  useEffect(() => {
+    const txnId = txnIdRef.current;
+    return () => {
+      if (inTxnRef.current) {
+        void invoke("finish_transaction", { txnId, commit: false }).catch(() => {});
+      }
+    };
+  }, []);
 
   const containerRef = useRef<HTMLDivElement | null>(null);
   const sqlRef = useRef(sql);
@@ -383,6 +483,58 @@ function QueryWorkspaceImpl({
           </label>
         )}
         <div className="flex-1" />
+        {supportsTxn &&
+          (inTxn ? (
+            <div className="flex items-center gap-1 shrink-0">
+              <span
+                className="flex items-center gap-1 text-[11px] font-semibold text-warn px-1.5"
+                title="A manual transaction is open. Statements run on one connection until you commit or roll back."
+              >
+                <span className="w-1.5 h-1.5 rounded-full bg-warn animate-pulse" />
+                TXN
+              </span>
+              <button
+                onClick={() => void finishTxn(true)}
+                disabled={txnBusy}
+                title="COMMIT the open transaction"
+                className="h-6 px-2 text-[11px] font-semibold text-white bg-ok rounded-md hover:opacity-90 disabled:opacity-60"
+              >
+                Commit
+              </button>
+              <button
+                onClick={() => void finishTxn(false)}
+                disabled={txnBusy}
+                title="ROLLBACK the open transaction"
+                className="h-6 px-2 text-[11px] font-semibold text-white bg-crit rounded-md hover:opacity-90 disabled:opacity-60"
+              >
+                Rollback
+              </button>
+              <span className="h-4 w-px bg-border" />
+            </div>
+          ) : (
+            <>
+              <button
+                onClick={() => void beginTxn()}
+                disabled={txnBusy || !conn.id}
+                title="BEGIN a manual transaction. Autocommit stays off until you commit or roll back."
+                className="h-6 px-2 text-[11px] text-ink-2 bg-panel border border-border rounded-md hover:bg-bg-2 disabled:opacity-60 disabled:cursor-not-allowed shrink-0"
+              >
+                Begin Txn
+              </button>
+              <span className="h-4 w-px bg-border" />
+            </>
+          ))}
+        <button
+          onClick={() => {
+            const view = editorRef.current?.view;
+            if (view) runFormat(view);
+          }}
+          disabled={!sql.trim()}
+          title="Format SQL — selection or whole editor (Cmd+Shift+F)"
+          className="h-6 px-2 text-[11px] text-ink-2 bg-panel border border-border rounded-md hover:bg-bg-2 disabled:opacity-60 disabled:cursor-not-allowed"
+        >
+          Format
+        </button>
         <button
           onClick={() => {
             if (!conn.id) return;
@@ -421,7 +573,7 @@ function QueryWorkspaceImpl({
         style={{ height: "34%", minHeight: 180, maxHeight: "60%" }}
       >
         <div className="flex-1 min-h-0 overflow-y-auto">
-          <SqlEditor value={sql} onChange={stableSetSql} onRun={stableRun} editorRef={editorRef} />
+          <SqlEditor value={sql} onChange={stableSetSql} onRun={stableRun} editorRef={editorRef} schema={schema} />
         </div>
         <div className="px-2 py-2 bg-panel-2 border-t border-border shrink-0">
           <AiStrip
@@ -576,6 +728,13 @@ function QueryWorkspaceImpl({
           onSort={stableSort}
           onClearSort={stableClearSort}
           sort={sortHint}
+          dbFilters={whereIsSupported(sql) ? dbFilters : undefined}
+          onDbFilterChange={stableSetDbFilter}
+          onClearDbFilters={stableClearDbFilters}
+          hiddenCols={hiddenCols}
+          onHiddenColsChange={setHiddenCols}
+          columnWidths={columnWidths}
+          onColumnWidthsChange={setColumnWidths}
         />
       ) : (
         <div className="flex-1 flex items-center justify-center text-muted text-[12px]">

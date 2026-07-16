@@ -40,6 +40,8 @@ type Props = {
   activityEmptyLabel?: string;
   /** Render a placeholder body instead of agents/activity (used when disabled). */
   empty?: ReactNode;
+  /** When provided, the dock header renders a collapse button that calls this. */
+  onClose?: () => void;
 };
 
 const TONE: Record<AgentBadge["tone"], string> = {
@@ -59,6 +61,7 @@ export function WorkspaceDock({
   activity = [],
   activityEmptyLabel = "No recent activity.",
   empty,
+  onClose,
 }: Props) {
   return (
     <aside className="w-[320px] shrink-0 bg-panel border-l border-border flex flex-col overflow-hidden">
@@ -73,12 +76,18 @@ export function WorkspaceDock({
         </span>
         <span className="text-[12px] font-bold text-ink">{title}</span>
         <div className="flex-1" />
-        <button
-          className="w-6 h-6 text-sm text-ink-2 hover:text-ink hover:bg-bg-2 rounded flex items-center justify-center"
-          title="Dock settings"
-        >
-          ⋯
-        </button>
+        {onClose && (
+          <button
+            onClick={onClose}
+            className="w-6 h-6 text-[12px] text-ink-2 hover:text-ink hover:bg-bg-2 rounded flex items-center justify-center"
+            title="Collapse AI Agents panel"
+            aria-label="Collapse panel"
+          >
+            <svg width="10" height="10" viewBox="0 0 10 10" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round">
+              <path d="M3.5 1.5 L7 5 L3.5 8.5" />
+            </svg>
+          </button>
+        )}
       </div>
 
       {empty ? (

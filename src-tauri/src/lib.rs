@@ -14,11 +14,14 @@ mod health;
 mod llm_log;
 mod mcp;
 mod milvus;
+mod objects;
 mod perf;
 mod query;
 mod redis_kind;
 mod sqlite_query;
 mod storage;
+mod sync;
+mod users;
 
 use serde::Serialize;
 use sqlx::mysql::{MySqlConnectOptions, MySqlPoolOptions};
@@ -43,10 +46,19 @@ struct AppState {
     sqlite: SqlitePool,
     active_pools: Arc<Mutex<HashMap<i64, MySqlPool>>>,
     active_milvus: Mutex<HashMap<i64, milvus::MilvusClient>>,
-    active_sqlite: Mutex<HashMap<i64, SqlitePool>>,
+    active_sqlite: Arc<Mutex<HashMap<i64, SqlitePool>>>,
     active_redis: Mutex<HashMap<i64, redis::aio::ConnectionManager>>,
     // query_token -> (connection_id, mysql_thread_id) for in-flight queries
     running_queries: Arc<Mutex<HashMap<String, (i64, u64)>>>,
+    // Manual-transaction sessions: txn_id (frontend tab id) -> (connection_id,
+    // the single pooled connection that BEGIN ran on). Every statement in the
+    // transaction must run on this same physical connection, so we hold it out
+    // of the pool until COMMIT / ROLLBACK returns it. The connection_id lets
+    // close/delete drop a connection's transactions before closing its pool.
+    // Inner Mutex serializes statements on the connection without holding the
+    // outer map lock for the query's duration.
+    active_txns:
+        Mutex<HashMap<String, (i64, Arc<Mutex<sqlx::pool::PoolConnection<sqlx::MySql>>>)>>,
     // Shared with the MCP server task so allowlist edits take effect live
     // without restarting Squire. Empty Vec means "allow all".
     mcp_allowed_conns: Arc<RwLock<Vec<i64>>>,
@@ -194,6 +206,7 @@ async fn save_connection(
 #[tauri::command]
 async fn delete_connection(state: State<'_, AppState>, id: i64) -> Result<(), String> {
     // Close active pools first (MySQL, SQLite, Milvus, Redis)
+    drop_txns_for_connection(&state, id).await;
     if let Some(pool) = state.active_pools.lock().await.remove(&id) {
         pool.close().await;
     }
@@ -318,6 +331,7 @@ async fn open_connection(state: State<'_, AppState>, id: i64) -> Result<(), Stri
 
 #[tauri::command]
 async fn close_connection(state: State<'_, AppState>, id: i64) -> Result<(), String> {
+    drop_txns_for_connection(&state, id).await;
     if let Some(pool) = state.active_pools.lock().await.remove(&id) {
         pool.close().await;
     }
@@ -327,6 +341,23 @@ async fn close_connection(state: State<'_, AppState>, id: i64) -> Result<(), Str
     state.active_milvus.lock().await.remove(&id);
     state.active_redis.lock().await.remove(&id);
     Ok(())
+}
+
+/// Drop (roll back implicitly, by dropping the connection) any manual
+/// transactions bound to `id`. Called before closing a connection's pool so
+/// held connections are released and `pool.close()` doesn't block on them.
+async fn drop_txns_for_connection(state: &AppState, id: i64) {
+    let mut txns = state.active_txns.lock().await;
+    let stale: Vec<String> = txns
+        .iter()
+        .filter(|(_, (cid, _))| *cid == id)
+        .map(|(k, _)| k.clone())
+        .collect();
+    for k in stale {
+        // Dropping the PoolConnection returns it to the pool; the open
+        // transaction is rolled back by the server when the session ends.
+        txns.remove(&k);
+    }
 }
 
 // ============================================================================
@@ -491,6 +522,7 @@ async fn execute_query(
     sql: String,
     query_token: Option<String>,
     database: Option<String>,
+    txn_id: Option<String>,
 ) -> Result<QueryResult, String> {
     if is_sqlite(&state, id).await {
         let pool = get_sqlite_pool(&state, id).await?;
@@ -531,6 +563,35 @@ async fn execute_query(
         .get(&id)
         .cloned()
         .ok_or_else(|| "Connection not open. Click 'Open' first.".to_string())?;
+
+    // Manual transaction: when this tab has an active transaction, every
+    // statement must run on the held connection (so BEGIN's isolation and
+    // uncommitted writes are visible). We clone the Arc, releasing the map lock
+    // before running, so a slow query doesn't block begin/finish on other tabs.
+    if let Some(tid) = txn_id.as_ref() {
+        let holder = state.active_txns.lock().await.get(tid).map(|h| h.1.clone());
+        if let Some(holder) = holder {
+            let mut conn = holder.lock().await;
+            let result = query::execute_on_conn(&mut conn, &sql).await;
+            let _ = storage::history::insert(
+                &state.sqlite,
+                id,
+                &sql,
+                result.as_ref().ok().map(|qr| qr.elapsed_ms as i64),
+                result.as_ref().ok().and_then(|qr| qr.rows_affected.map(|n| n as i64)),
+                result.as_ref().ok().map(|qr| qr.rows.len() as i64),
+                result.as_ref().err().map(|e| e.to_string()).as_deref(),
+            )
+            .await;
+            let mut qr = result.map_err(|e| format!("query failed: {e}"))?;
+            if !qr.columns.is_empty() {
+                qr.editable = query::resolve_editable(&pool, &sql, &qr.columns).await;
+            }
+            return Ok(qr);
+        }
+        // txn_id passed but not active (e.g. after commit) — fall through to the
+        // normal pool path.
+    }
 
     // When the caller picks a database for this query, we acquire a conn,
     // run `USE` on it via the text protocol (raw_sql), then run the user SQL.
@@ -617,6 +678,69 @@ async fn execute_query(
         qr.editable = query::resolve_editable(&pool, &sql, &qr.columns).await;
     }
     Ok(qr)
+}
+
+/// Begin a manual transaction bound to `txn_id` (the frontend tab id). Acquires
+/// one pooled connection, runs BEGIN on it, and holds it out of the pool until
+/// commit / rollback. Errors if a transaction is already active for this id.
+/// MySQL only — transactions on the shared pool would land on arbitrary
+/// physical connections, so a single held connection is mandatory.
+#[tauri::command]
+async fn begin_transaction(
+    state: State<'_, AppState>,
+    id: i64,
+    txn_id: String,
+) -> Result<(), String> {
+    {
+        let txns = state.active_txns.lock().await;
+        if txns.contains_key(&txn_id) {
+            return Err("A transaction is already active for this tab.".to_string());
+        }
+    }
+    let pool = state
+        .active_pools
+        .lock()
+        .await
+        .get(&id)
+        .cloned()
+        .ok_or_else(|| "Connection not open. Click 'Open' first.".to_string())?;
+    let mut conn = pool
+        .acquire()
+        .await
+        .map_err(|e| format!("acquire connection failed: {e}"))?;
+    query::execute_on_conn(&mut conn, "BEGIN")
+        .await
+        .map_err(|e| format!("BEGIN failed: {e}"))?;
+    state
+        .active_txns
+        .lock()
+        .await
+        .insert(txn_id, (id, Arc::new(Mutex::new(conn))));
+    Ok(())
+}
+
+/// Finish a manual transaction: `commit` = true runs COMMIT, false runs
+/// ROLLBACK. Removes the held connection so it returns to the pool. No-op error
+/// if the transaction isn't active (already finished / never began).
+#[tauri::command]
+async fn finish_transaction(
+    state: State<'_, AppState>,
+    txn_id: String,
+    commit: bool,
+) -> Result<(), String> {
+    let holder = state
+        .active_txns
+        .lock()
+        .await
+        .remove(&txn_id)
+        .ok_or_else(|| "No active transaction for this tab.".to_string())?;
+    let mut conn = holder.1.lock().await;
+    let stmt = if commit { "COMMIT" } else { "ROLLBACK" };
+    query::execute_on_conn(&mut conn, stmt)
+        .await
+        .map_err(|e| format!("{stmt} failed: {e}"))?;
+    // `conn` (and the Arc) drop here, returning the connection to the pool.
+    Ok(())
 }
 
 #[tauri::command]
@@ -4238,6 +4362,120 @@ async fn get_innodb_status_raw(
     Ok(text)
 }
 
+// ---------- Cloud sync (S3) ---------- //
+
+const APP_VERSION_FOR_SYNC: &str = env!("CARGO_PKG_VERSION");
+
+#[tauri::command]
+async fn sync_get_config(
+    state: State<'_, AppState>,
+) -> Result<sync::config::SyncConfigDisplay, String> {
+    sync::config::load_display(&state.sqlite).await
+}
+
+#[tauri::command]
+async fn sync_save_config(
+    state: State<'_, AppState>,
+    input: sync::config::SyncConfigInput,
+) -> Result<(), String> {
+    sync::config::save(&state.sqlite, &input).await?;
+    // Verify by listing — surfaces wrong AK/SK / bucket / endpoint early.
+    let cfg = sync::config::load_full(&state.sqlite).await?;
+    sync::s3::list_devices(&cfg)
+        .await
+        .map_err(|e| format!("verify list: {e}"))?;
+    Ok(())
+}
+
+#[tauri::command]
+async fn sync_clear_config(state: State<'_, AppState>) -> Result<(), String> {
+    sync::config::clear(&state.sqlite).await
+}
+
+#[derive(Serialize)]
+struct SyncPushResult {
+    device_name: String,
+    object_key: String,
+    bytes: usize,
+    pushed_at: String,
+}
+
+#[tauri::command]
+async fn sync_push(state: State<'_, AppState>) -> Result<SyncPushResult, String> {
+    let cfg = sync::config::load_full(&state.sqlite).await?;
+    let disp = sync::config::load_display(&state.sqlite).await?;
+    let snapshot =
+        sync::snapshot::dump(&state.sqlite, &disp.device_name, APP_VERSION_FOR_SYNC).await?;
+    let bytes = sync::bundle::pack(&snapshot)?;
+    let key = sync::s3::build_key(&cfg.prefix, &disp.device_name);
+    sync::s3::put_object(&cfg, &key, &bytes).await?;
+    let now = chrono::Utc::now().to_rfc3339();
+    sync::config::mark_pushed(&state.sqlite, &now).await?;
+    Ok(SyncPushResult {
+        device_name: disp.device_name,
+        object_key: key,
+        bytes: bytes.len(),
+        pushed_at: now,
+    })
+}
+
+#[tauri::command]
+async fn sync_list_devices(
+    state: State<'_, AppState>,
+) -> Result<Vec<sync::s3::DeviceObject>, String> {
+    let cfg = sync::config::load_full(&state.sqlite).await?;
+    sync::s3::list_devices(&cfg).await
+}
+
+#[derive(Serialize)]
+struct SyncPullPreview {
+    device_name: String,
+    meta: sync::bundle::BundleMeta,
+    conflict_report: sync::snapshot::ConflictReport,
+    snapshot: sync::snapshot::Snapshot,
+}
+
+#[tauri::command]
+async fn sync_preview_pull(
+    state: State<'_, AppState>,
+    device_name: String,
+) -> Result<SyncPullPreview, String> {
+    let cfg = sync::config::load_full(&state.sqlite).await?;
+    let key = sync::s3::build_key(&cfg.prefix, &device_name);
+    let bytes = sync::s3::get_object(&cfg, &key).await?;
+    let (meta, snapshot) = sync::bundle::unpack(&bytes)?;
+    let conflict_report = sync::snapshot::diff(&state.sqlite, &snapshot).await?;
+    Ok(SyncPullPreview {
+        device_name,
+        meta,
+        conflict_report,
+        snapshot,
+    })
+}
+
+#[tauri::command]
+async fn sync_apply_pull(
+    state: State<'_, AppState>,
+    device_name: String,
+    snapshot: sync::snapshot::Snapshot,
+    resolutions: sync::snapshot::ResolutionMap,
+) -> Result<sync::snapshot::RestoreReport, String> {
+    let report = sync::snapshot::restore(&state.sqlite, &snapshot, &resolutions).await?;
+    let now = chrono::Utc::now().to_rfc3339();
+    sync::config::mark_pulled(&state.sqlite, &now, &device_name).await?;
+    Ok(report)
+}
+
+#[tauri::command]
+async fn sync_delete_device(
+    state: State<'_, AppState>,
+    device_name: String,
+) -> Result<(), String> {
+    let cfg = sync::config::load_full(&state.sqlite).await?;
+    let key = sync::s3::build_key(&cfg.prefix, &device_name);
+    sync::s3::delete_object(&cfg, &key).await
+}
+
 // ---------- MCP settings commands ---------- //
 
 #[derive(Serialize)]
@@ -4247,6 +4485,7 @@ struct McpStatus {
     bind_port: u16,
     read_only: bool,
     allowed_conn_ids: Vec<i64>,
+    write_databases: Vec<storage::mcp_settings::WriteDbPerm>,
     running: bool,
     actual_port: u16,
     requires_restart: bool,
@@ -4275,6 +4514,7 @@ async fn get_mcp_status(state: State<'_, AppState>) -> Result<McpStatus, String>
         bind_port: settings.bind_port,
         read_only: settings.read_only,
         allowed_conn_ids: settings.allowed_conn_ids,
+        write_databases: settings.write_databases,
         running,
         actual_port,
         requires_restart,
@@ -4320,6 +4560,32 @@ async fn set_mcp_allowed_conns(
 }
 
 #[tauri::command]
+async fn set_mcp_read_only(
+    state: State<'_, AppState>,
+    read_only: bool,
+) -> Result<McpStatus, String> {
+    let mut s = storage::mcp_settings::get(&state.sqlite).await?;
+    s.read_only = read_only;
+    storage::mcp_settings::save(&state.sqlite, &s).await?;
+    get_mcp_status(state).await
+}
+
+#[tauri::command]
+async fn set_mcp_write_databases(
+    state: State<'_, AppState>,
+    write_databases: Vec<storage::mcp_settings::WriteDbPerm>,
+) -> Result<McpStatus, String> {
+    let mut s = storage::mcp_settings::get(&state.sqlite).await?;
+    // Drop empty-op grants so they don't linger as no-op rows.
+    s.write_databases = write_databases
+        .into_iter()
+        .filter(|p| !p.ops.is_empty())
+        .collect();
+    storage::mcp_settings::save(&state.sqlite, &s).await?;
+    get_mcp_status(state).await
+}
+
+#[tauri::command]
 async fn get_mcp_token(state: State<'_, AppState>) -> Result<String, String> {
     crypto::ensure_mcp_token(&state.sqlite).await
 }
@@ -4356,6 +4622,79 @@ async fn generate_alter_sql(edit: ddl::TableEdit) -> Result<ddl::AlterPlan, Stri
 #[tauri::command]
 async fn generate_create_sql(spec: ddl::TableStructure) -> Result<String, String> {
     ddl::generate_create_sql(&spec)
+}
+
+#[tauri::command]
+async fn list_db_objects(
+    state: State<'_, AppState>,
+    connection_id: i64,
+    database: String,
+    kind: String,
+) -> Result<Vec<objects::DbObject>, String> {
+    let pool = state
+        .active_pools
+        .lock()
+        .await
+        .get(&connection_id)
+        .cloned()
+        .ok_or_else(|| "Connection not open".to_string())?;
+    objects::list_objects(&pool, &database, &kind).await
+}
+
+#[tauri::command]
+async fn show_object_ddl(
+    state: State<'_, AppState>,
+    connection_id: i64,
+    database: String,
+    kind: String,
+    name: String,
+) -> Result<String, String> {
+    let pool = state
+        .active_pools
+        .lock()
+        .await
+        .get(&connection_id)
+        .cloned()
+        .ok_or_else(|| "Connection not open".to_string())?;
+    objects::show_object_ddl(&pool, &database, &kind, &name).await
+}
+
+#[tauri::command]
+async fn list_db_users(
+    state: State<'_, AppState>,
+    connection_id: i64,
+) -> Result<Vec<users::DbUser>, String> {
+    let pool = state
+        .active_pools
+        .lock()
+        .await
+        .get(&connection_id)
+        .cloned()
+        .ok_or_else(|| "Connection not open".to_string())?;
+    users::list_users(&pool).await
+}
+
+/// Preview the SQL a user action will run, without executing it. Powers the
+/// confirmation dialog.
+#[tauri::command]
+async fn preview_user_action(action: users::UserAction) -> Result<String, String> {
+    users::action_sql(&action)
+}
+
+#[tauri::command]
+async fn apply_user_action(
+    state: State<'_, AppState>,
+    connection_id: i64,
+    action: users::UserAction,
+) -> Result<String, String> {
+    let pool = state
+        .active_pools
+        .lock()
+        .await
+        .get(&connection_id)
+        .cloned()
+        .ok_or_else(|| "Connection not open".to_string())?;
+    users::apply_user_action(&pool, &action).await
 }
 
 #[tauri::command]
@@ -4589,6 +4928,8 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_fs::init())
         .plugin(tauri_plugin_clipboard_manager::init())
+        .plugin(tauri_plugin_updater::Builder::new().build())
+        .plugin(tauri_plugin_process::init())
         .setup(|app| {
             let app_data_dir = app.path().app_data_dir()?;
             fs::create_dir_all(&app_data_dir)?;
@@ -4611,6 +4952,7 @@ pub fn run() {
             }
 
             let active_pools = Arc::new(Mutex::new(HashMap::<i64, MySqlPool>::new()));
+            let active_sqlite = Arc::new(Mutex::new(HashMap::<i64, SqlitePool>::new()));
 
             // Seed allowlist from SQLite on boot so the Tauri command and the
             // MCP server start in sync. Shared Arc lets later edits propagate
@@ -4625,6 +4967,7 @@ pub fn run() {
             // Boot MCP server if enabled. Token is seeded on first run.
             let mcp_sqlite = pool.clone();
             let mcp_pools = active_pools.clone();
+            let mcp_sqlite_pools = active_sqlite.clone();
             let mcp_allowed_for_server = mcp_allowed_conns.clone();
             let bind_port = initial_settings.bind_port;
             let enabled = initial_settings.enabled;
@@ -4645,6 +4988,7 @@ pub fn run() {
                     token,
                     mcp_sqlite,
                     mcp_pools,
+                    mcp_sqlite_pools,
                     mcp_allowed_for_server,
                 )
                 .await
@@ -4657,9 +5001,10 @@ pub fn run() {
                 sqlite: pool,
                 active_pools,
                 active_milvus: Mutex::new(HashMap::new()),
-                active_sqlite: Mutex::new(HashMap::new()),
+                active_sqlite: active_sqlite.clone(),
                 active_redis: Mutex::new(HashMap::new()),
                 running_queries: Arc::new(Mutex::new(HashMap::new())),
+                active_txns: Mutex::new(HashMap::new()),
                 mcp_allowed_conns,
             });
             Ok(())
@@ -4680,6 +5025,8 @@ pub fn run() {
             close_connection,
             execute_query,
             cancel_query,
+            begin_transaction,
+            finish_transaction,
             update_cell,
             insert_row,
             delete_rows,
@@ -4768,11 +5115,18 @@ pub fn run() {
             set_mcp_enabled,
             set_mcp_port,
             set_mcp_allowed_conns,
+            set_mcp_read_only,
+            set_mcp_write_databases,
             get_mcp_token,
             regenerate_mcp_token,
             get_table_structure,
             generate_alter_sql,
             generate_create_sql,
+            list_db_objects,
+            show_object_ddl,
+            list_db_users,
+            preview_user_action,
+            apply_user_action,
             dump_database_schema,
             save_query,
             list_saved_queries,
@@ -4787,6 +5141,14 @@ pub fn run() {
             drop_table,
             ai_table_edit,
             ai_create_table,
+            sync_get_config,
+            sync_save_config,
+            sync_clear_config,
+            sync_push,
+            sync_list_devices,
+            sync_preview_pull,
+            sync_apply_pull,
+            sync_delete_device,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
